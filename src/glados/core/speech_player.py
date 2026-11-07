@@ -170,6 +170,9 @@ class SpeechPlayer:
                             )
 
                         self.audio_io.start_speaking(audio_msg.audio, self.tts_sample_rate)
+                        # Record spoken text BEFORE playback so echo detection works during TTS
+                        if self._echo_detector:
+                            self._echo_detector.record_spoken(audio_msg.text)
                     if self._speech_animation:
                         self._speech_animation.set(True, audio_msg.emotion)
                     logger.success(f"TTS text: {audio_msg.text}")
