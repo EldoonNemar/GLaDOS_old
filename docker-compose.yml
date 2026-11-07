@@ -33,8 +33,6 @@ services:
       - GLADOS_ECHO_TEXT_SIMILARITY_THRESHOLD=0.7
       - GLADOS_ECHO_TEXT_MIN_LENGTH=4
       - GLADOS_ECHO_RECENT_TURNS=3
-      # ASR engine: tdt (Parakeet TDT), ctc (Parakeet CTC), or whisper (OpenAI Whisper)
-      - GLADOS_ASR_ENGINE=whisper
     volumes:
       # Persist conversation history and memory
       - glados-data:/app/data

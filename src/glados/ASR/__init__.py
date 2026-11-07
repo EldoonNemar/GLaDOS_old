@@ -25,7 +25,6 @@ def get_audio_transcriber(
         engine_type (str): The type of ASR engine to use:
             - "ctc": Connectionist Temporal Classification model (faster, good accuracy)
             - "tdt": Token and Duration Transducer model (best accuracy, slightly slower)
-            - "whisper": OpenAI Whisper model (most robust, handles accents well)
         **kwargs: Additional keyword arguments to pass to the transcriber constructor
 
     Returns:
@@ -42,10 +41,6 @@ def get_audio_transcriber(
         from .tdt_asr import AudioTranscriber as TDTTranscriber
 
         return TDTTranscriber()
-    elif engine_type.lower() == "whisper":
-        from .whisper_asr import AudioTranscriber as WhisperTranscriber
-
-        return WhisperTranscriber(**kwargs)
     else:
         raise ValueError(f"Unsupported ASR engine type: {engine_type}")
 
