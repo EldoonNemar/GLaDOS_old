@@ -595,8 +595,6 @@ class WebsocketAudioIO(AudioIO):
                 continue
 
             try:
-                # Mute mic during playback to prevent echo feedback
-                self._is_listening = False
                 # Send timestamp, then sample rate, then bytes
                 await websocket.send("time:" + str(play_time))
                 await websocket.send("sampleRate:" + str(sample_rate))
@@ -604,27 +602,22 @@ class WebsocketAudioIO(AudioIO):
 
                 logger.debug(f"Playing audio with sample rate: {sample_rate} Hz, length: {sample_count} samples")
             except websockets.exceptions.ConnectionClosed:
-                self._is_listening = True
-                set_flags_once(current_id, True)
+                set_flags_once(current_track_id, True)
                 return
 
             # 3. WAITING PHASE
-            try:
-                while self._track_is_active(current_track_id) and not self._playback_should_stop():
-                    try:
-                        message = await asyncio.wait_for(websocket.recv(), timeout=0.05)
-                        if await handle_default_msg(message) and message == "played":
-                            logger.debug("Websocket: Audio played fully")
-                            set_flags_once(current_track_id, False)
-                            break
-                    except TimeoutError:
-                        continue
-                    except websockets.exceptions.ConnectionClosed:
-                        set_flags_once(current_track_id, True)
-                        return
-            finally:
-                # Unmute mic after playback completes
-                self._is_listening = True
+            while self._track_is_active(current_track_id) and not self._playback_should_stop():
+                try:
+                    message = await asyncio.wait_for(websocket.recv(), timeout=0.05)
+                    if await handle_default_msg(message) and message == "played":
+                        logger.debug("Websocket: Audio played fully")
+                        set_flags_once(current_track_id, False)
+                        break
+                except TimeoutError:
+                    continue
+                except websockets.exceptions.ConnectionClosed:
+                    set_flags_once(current_track_id, True)
+                    return
             if self._playback_should_stop():
                 try:
                     await websocket.send("reset")
