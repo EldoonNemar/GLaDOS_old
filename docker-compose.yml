@@ -36,8 +36,6 @@ services:
       - "65536"
       - "--parallel"
       - "4"
-      - "--ctx-offset"
-      - "16384"
       - "-ngl"
       - "99"
     networks:
