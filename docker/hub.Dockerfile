@@ -25,7 +25,7 @@ COPY configs/ ./configs/
 
 # Install deps — editable install so resource_path resolves correctly
 # Also installs onnxruntime-cpu for TTS/VAD and litestar for TTS API
-RUN uv venv .venv && uv pip install -e ".[cpu,api,whisper]"
+RUN uv venv .venv && uv pip install -e ".[cpu,api]"
 
 # Download required models (VAD + TTS)
 RUN uv run --no-sync glados download
