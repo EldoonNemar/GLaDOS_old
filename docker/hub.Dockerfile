@@ -21,6 +21,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 COPY configs/ ./configs/
+COPY data/ ./data/
 
 # Install deps — editable install so resource_path resolves correctly
 # Also installs onnxruntime-cpu for TTS/VAD and litestar for TTS API
