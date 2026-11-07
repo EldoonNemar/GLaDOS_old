@@ -64,15 +64,6 @@ class EchoDetector:
             if len(spoken_lower) < self.min_length:
                 continue
 
-            # Check if transcription is a prefix or substring of spoken text (partial echo)
-            if trans_lower in spoken_lower:
-                if self._bus:
-                    self._bus.emit(
-                        "echo", "detected", f"Partial echo detected (substring match)",
-                        meta={"transcription": transcription[:100], "spoken": spoken[:100]},
-                    )
-                return True
-
             # Levenshtein similarity: 1 - (distance / max_length)
             max_len = max(len(trans_lower), len(spoken_lower))
             if max_len == 0:
