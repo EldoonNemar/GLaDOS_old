@@ -120,9 +120,17 @@ async def download_models() -> int:
         - TTS model: glados.onnx
         - Phonemizer model: phomenizer_en.onnx
 
+    If all models are already present and verified, skips the download entirely.
+
     Returns:
         int: Exit code (0 for success, 1 for failure)
     """
+    if models_valid():
+        rprint("\n[bold green]All model files already present and verified. Nothing to download.")
+        return 0
+
+    rprint("\nSome models are missing or invalid — downloading now...")
+
     with Progress(
         TextColumn("[grey50][progress.description]{task.description}"),
         BarColumn(),
