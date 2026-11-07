@@ -56,7 +56,8 @@ class WebsocketAudioIO(AudioIO):
     real-time audio capture with voice activity detection and audio playback.
     """
 
-    SAMPLE_RATE: int = 16000  # Sample rate for input stream
+    SAMPLE_RATE: int = 22050  # Sample rate for TTS output stream; mic is resampled to 16000 for ASR
+    VAD_SAMPLE_RATE: int = 16000  # Sample rate for VAD and ASR
     VAD_SIZE: int = 32  # Milliseconds of sample for Voice Activity Detection (VAD)
     VAD_THRESHOLD: float = 0.8  # Threshold for VAD detection
     SERVER: str = "0.0.0.0"  # websockets server listen address
@@ -639,7 +640,7 @@ class WebsocketAudioIO(AudioIO):
         # VAD is per microphone because it stores context
         vad_model = VAD()
         # needed amount of samples for VAD
-        vad_needed_samples = self.SAMPLE_RATE * self.VAD_SIZE // 1000
+        vad_needed_samples = self.VAD_SAMPLE_RATE * self.VAD_SIZE // 1000
         # currently stored samples
         current_data = np.empty((0,), dtype=np.float32)
         # room of the mic
