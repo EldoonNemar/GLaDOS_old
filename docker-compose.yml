@@ -1,13 +1,49 @@
 # GLaDOS Hub — orchestrates spokes on your ROCm server
 #
 # Prerequisites:
-#   - llama.cpp running as `llama_rocm` (already running on port 8000)
+#   - llama.cpp running as `glados_llama` with Gemma 4 E4B (port 18080)
 #   - Docker Compose v2
 #
 # Spoke devices connect to this hub via WebSocket on port 5051.
-# The hub talks to llama.cpp at port 8000 (the `llama_rocm` container).
+# The hub talks to llama.cpp at port 8080 (the `glados_llama` container).
 
 services:
+  glados_llama:
+    image: ghcr.io/ggml-org/llama.cpp:server-rocm
+    container_name: glados_llama
+    restart: unless-stopped
+    devices:
+      - "/dev/kfd:/dev/kfd"
+      - "/dev/dri:/dev/dri"
+    group_add:
+      - video
+      - render
+    ports:
+      - "18080:8080"
+    volumes:
+      - ./models:/models
+    environment:
+      - HIP_VISIBLE_DEVICES=0,1
+      - GGML_CUDA_P2P=1
+    command:
+      - "-m"
+      - "/models/gemma-4-E4B-Q4_K_M.gguf"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "-c"
+      - "65536"
+      - "--parallel"
+      - "4"
+      - "--ctx-offset"
+      - "16384"
+      - "-ngl"
+      - "99"
+    networks:
+      - glados
+      - jigowatts_default
+
   hub:
     build:
       context: .
@@ -19,7 +55,7 @@ services:
       - "5051:5051"   # WebSocket audio (mic + speaker)
     environment:
       # Point to your llama.cpp container
-      - GLADOS_LLM_URL=http://llama_rocm:8080/v1/chat/completions
+      - GLADOS_LLM_URL=http://glados_llama:8080/v1/chat/completions
       - GLADOS_LLM_MODEL=gemma-4-E4B
       # Enable native audio mode for lowest latency
       - GLADOS_NATIVE_AUDIO_ENABLED=false
@@ -51,7 +87,7 @@ services:
       - "5050:5050"   # TTS API (OpenAI-compatible)
     command: ["/usr/local/bin/uv", "run", "litestar", "--app", "glados.api.app:create_app", "run", "--host", "0.0.0.0", "--port", "5050"]
     environment:
-      - GLADOS_LLM_URL=http://llama_rocm:8080/v1/chat/completions
+      - GLADOS_LLM_URL=http://glados_llama:8080/v1/chat/completions
       - GLADOS_LLM_MODEL=gemma-4-E4B
     volumes:
       # Mount host models directory
