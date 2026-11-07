@@ -24,7 +24,7 @@ spoke:
   mic_volume: 1.0
 
   # --- Audio playback (hub to spoke) ---
-  spk_sample_rate: 22050
+  spk_sample_rate: 16000
   spk_device: null
 
   # --- Jitter buffer ---
