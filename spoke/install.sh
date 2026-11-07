@@ -9,6 +9,10 @@ VENV_DIR="$SCRIPT_DIR/.venv"
 
 echo "=== GLaDOS Spoke Installer ==="
 
+# Install system dependencies
+echo "Installing system dependencies..."
+apt-get update && apt-get install -y libportaudio2
+
 # Check if venv already exists
 if [ -d "$VENV_DIR" ]; then
     echo "Virtual environment already exists at $VENV_DIR"
