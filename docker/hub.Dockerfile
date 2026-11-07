@@ -49,6 +49,7 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/src /app/src
 COPY --from=builder /app/configs /app/configs
 COPY --from=builder /app/pyproject.toml /app/README.md /app/
+COPY --from=builder /app/data /app/data
 
 EXPOSE 5050 5051
 
