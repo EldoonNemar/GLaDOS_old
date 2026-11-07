@@ -6,7 +6,6 @@
 #
 # The hub connects to your llama_rocm container for inference.
 # It runs TTS and audio relay on CPU (fast enough for relay-only workload).
-# Whisper ASR uses ROCm GPU for fast transcription.
 
 FROM python:3.12-slim AS builder
 
@@ -42,9 +41,6 @@ RUN apt-get update && apt-get install -y \
     libstdc++6 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
-
-# Install ROCm for GPU acceleration (PyTorch with ROCm)
-RUN pip install torch --index-url https://download.pytorch.org/whl/rocm6.2.4
 
 WORKDIR /app
 

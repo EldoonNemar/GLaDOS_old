@@ -15,9 +15,6 @@ services:
     image: glados-hub:latest
     container_name: glados_hub
     restart: unless-stopped
-    devices:
-      - /dev/kfd
-      - /dev/dri
     ports:
       - "5051:5051"   # WebSocket audio (mic + speaker)
     environment:
