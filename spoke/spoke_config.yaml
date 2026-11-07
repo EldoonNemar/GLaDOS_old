@@ -27,7 +27,7 @@ spoke:
 
   # --- Audio playback (hub to spoke) ---
   spk_sample_rate: 16000
-  spk_device: "Headphones"
+  spk_device: null
 
   # --- Jitter buffer ---
   jitter_buffer_min_ms: 80
