@@ -34,8 +34,6 @@ services:
       - GLADOS_ECHO_TEXT_MIN_LENGTH=4
       - GLADOS_ECHO_RECENT_TURNS=3
     volumes:
-      # Persist conversation history and memory
-      - glados-data:/app/data
       # Mount host models directory (bind mount, not named volume)
       - ./models:/app/models
     networks:
@@ -60,9 +58,6 @@ services:
       - ./models:/app/models
     networks:
       - glados
-
-volumes:
-  glados-data:
 
 networks:
   glados:

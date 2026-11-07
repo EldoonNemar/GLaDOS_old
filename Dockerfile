@@ -21,6 +21,7 @@ RUN chown glados:glados /app
 COPY --chown=glados:glados pyproject.toml README.md ./
 COPY --chown=glados:glados models/ ./models/
 COPY --chown=glados:glados src/ ./src/
+COPY --chown=glados:glados data/ ./data/
 
 USER glados
 
