@@ -37,8 +37,8 @@ Glados:
       weather:
         enabled: true
         interval_s: 3600
-        latitude: 51.5074
-        longitude: -0.1278
+        latitude: 38.7419
+        longitude: -77.7696
         timezone: "auto"
         temp_change_c: 4
         wind_alert_kmh: 40
