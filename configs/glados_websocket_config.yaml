@@ -28,17 +28,17 @@ Glados:
     autonomy_parallel_calls: 2
     autonomy_queue_max: null
     jobs:
-      enabled: false
+      enabled: true
       hacker_news:
-        enabled: false
+        enabled: true
         interval_s: 1800
         top_n: 5
         min_score: 200
       weather:
-        enabled: false
+        enabled: true
         interval_s: 3600
-        latitude: null
-        longitude: null
+        latitude: 51.5074
+        longitude: -0.1278
         timezone: "auto"
         temp_change_c: 4
         wind_alert_kmh: 40
@@ -55,6 +55,10 @@ Glados:
       transport: "stdio"
       command: "python"
       args: ["-m", "glados.mcp.memory_server"]
+    - name: "internet_search"
+      transport: "http"
+      url: "https://mcp.exa.ai/mcp?tools=web_search_exa"
+      allowed_tools: ["web_search_exa"]
     # - name: "time_info"
     #   transport: "stdio"
     #   command: "python"
