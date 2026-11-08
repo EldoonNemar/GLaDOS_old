@@ -3,6 +3,7 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y \
   libportaudio2 \
   portaudio19-dev \
+  libspeexdsp-dev \
   libgl1 \
   libglib2.0-0 \
   git \

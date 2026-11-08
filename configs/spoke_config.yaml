@@ -37,7 +37,7 @@ spoke:
   echo_text_min_length: 4
   echo_text_recent_turns: 3
   echo_waveform_threshold: 0.6
-  echo_aec_enabled: false
+  echo_aec_enabled: true
   echo_aec_order: 256
   echo_mute_on_detection_ms: 0
 

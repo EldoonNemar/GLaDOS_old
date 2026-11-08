@@ -6,42 +6,70 @@ import logging
 import math
 import numpy as np
 from numpy.typing import NDArray
-import sounddevice as sd
 
+try:
+    from speexdsp import EchoCanceller as _SpeexEchoCanceller
+    _HAS_SPEEX = True
+except ImportError:
+    _HAS_SPEEX = False
+
+try:
+    import sounddevice as sd
+    _HAS_SD = True
+except ImportError:
+    _HAS_SD = False
 
 logger = logging.getLogger(__name__)
 
 
-class BasicAEC:
-    """Simplified AEC using LMS adaptive filtering."""
+class SpeexAEC:
+    """Acoustic echo cancellation backed by libspeexdsp.
 
-    def __init__(self, order: int = 256, step_size: float = 0.001) -> None:
-        self.order = order
-        self.step_size = step_size
-        self._weights = np.zeros(order, dtype=np.float32)
-        self._delay = max(2, order // 16)
+    Uses the known playback audio (reference signal) to estimate the echo
+    path and subtract it from the microphone input via frequency-domain
+    adaptive filtering.
+
+    Requires the system package ``libspeexdsp-dev`` (Debian/Ubuntu) to build.
+    """
+
+    def __init__(self, sample_rate: int = 16000, frame_size: int = 512) -> None:
+        self.sample_rate = sample_rate
+        self.frame_size = frame_size
+        self._aec = _SpeexEchoCanceller.create(frame_size, 4096, sample_rate)
+        self._ref_buffer: NDArray[np.float32] = np.empty(0, dtype=np.float32)
+
+    def update_reference(self, samples: NDArray[np.float32]) -> None:
+        """Update the playback reference at the AEC sample rate."""
+        if len(samples) == 0:
+            self._ref_buffer = np.empty(0, dtype=np.float32)
+            return
+        from scipy import signal as scipy_signal
+        if self.sample_rate != 16000:
+            divisor = math.gcd(self.sample_rate, 16000)
+            samples = scipy_signal.resample_poly(
+                samples, 16000 // divisor, self.sample_rate // divisor,
+            ).astype(np.float32)
+        self._ref_buffer = samples
 
     def process(self, mic: NDArray[np.float32], ref: NDArray[np.float32]) -> NDArray[np.float32]:
+        """Run AEC on a single mic frame using the reference playback audio."""
         if len(mic) == 0:
             return mic
-        ref_aligned = ref[max(0, len(ref) - self.order - self._delay):len(ref) - self._delay]
-        if len(ref_aligned) < self.order:
+        if len(ref) < self.frame_size:
             return mic
-        output = mic.copy()
-        for i in range(len(mic)):
-            if i + self.order <= len(ref_aligned):
-                tap = ref_aligned[i: i + self.order]
-                echo_estimate = float(np.dot(self._weights, tap))
-                output[i] = mic[i] - echo_estimate
-                self._weights += self.step_size * (mic[i] - echo_estimate) * tap
-                energy = np.dot(tap, tap)
-                if energy > 0:
-                    self._weights *= min(1.0, 0.99 / max(math.sqrt(energy / self.order + 1e-12), 1e-12))
-        return output.astype(np.float32)
+
+        mic_bytes = mic[:self.frame_size].astype(np.int16).tobytes()
+        ref_bytes = ref[:self.frame_size].astype(np.int16).tobytes()
+
+        cleaned_bytes = self._aec.process(mic_bytes, ref_bytes)
+        cleaned = np.frombuffer(cleaned_bytes, dtype=np.int16).astype(np.float32)
+        return cleaned
 
 
 class SpokeAudio:
     """Manages local mic capture and speaker playback."""
+
+    MIC_SAMPLE_RATE = 16000
 
     def __init__(
         self,
@@ -53,8 +81,10 @@ class SpokeAudio:
         spk_sample_rate: int = 22050,
         spk_device: int | str | None = None,
         echo_aec_enabled: bool = False,
-        echo_aec_order: int = 256,
+        echo_aec_order: int = 256,  # noqa: ARG002 -- kept for config compat
     ) -> None:
+        if not _HAS_SD:
+            raise ImportError("sounddevice is required for spoke audio")
         self.mic_sample_rate = mic_sample_rate
         self.mic_channels = mic_channels
         self.mic_chunk_frames = mic_chunk_frames
@@ -62,7 +92,11 @@ class SpokeAudio:
         self.mic_volume = mic_volume
         self.spk_sample_rate = spk_sample_rate
         self.spk_device = spk_device
-        self._aec = BasicAEC(order=echo_aec_order) if echo_aec_enabled else None
+        self._aec: SpeexAEC | None = (
+            SpeexAEC(sample_rate=self.MIC_SAMPLE_RATE, frame_size=mic_chunk_frames)
+            if echo_aec_enabled and _HAS_SPEEX
+            else None
+        )
         self._mic_stream = None
         self._spk_stream = None
         self._playback_ref = np.empty(0, dtype=np.float32)
@@ -97,15 +131,15 @@ class SpokeAudio:
             logger.warning("Mic status: %s", status)
         logger.debug("Mic callback: shape=%s, status=%s", indata.shape, status)
         samples = np.ascontiguousarray(indata[:, 0], dtype=np.float32) * self.mic_volume
-        
+
         # Normalize audio to [-1, 1] range for consistent ASR performance
         peak = np.max(np.abs(samples))
         if peak > 1.0:
             samples = samples / peak
         elif peak < 0.01 and len(samples) > 0:  # Skip very quiet audio
             return
-        
-        if self._aec is not None and len(self._playback_ref) >= self._aec.order:
+
+        if self._aec is not None and len(self._playback_ref) >= self._aec.frame_size:
             samples = self._aec.process(samples, self._playback_ref)
         if self._callback:
             self._callback(samples)
@@ -138,11 +172,14 @@ class SpokeAudio:
             return
         if self._spk_stream is None:
             return  # No speaker available
-        if self.spk_sample_rate != 16000:
-            from scipy import signal
-            divisor = math.gcd(16000, self.spk_sample_rate)
-            samples = signal.resample_poly(samples, self.spk_sample_rate // divisor, 16000 // divisor).astype(np.float32)
+        if self.spk_sample_rate != self.MIC_SAMPLE_RATE:
+            from scipy import signal as scipy_signal
+            divisor = math.gcd(self.MIC_SAMPLE_RATE, self.spk_sample_rate)
+            samples = scipy_signal.resample_poly(
+                samples, self.spk_sample_rate // divisor, self.MIC_SAMPLE_RATE // divisor,
+            ).astype(np.float32)
         self._playback_ref = samples
+        self._aec.update_reference(samples)
         try:
             sd.play(samples, self.spk_sample_rate, blocking=False)
         except Exception:
@@ -151,3 +188,4 @@ class SpokeAudio:
     def shutdown(self) -> None:
         self.stop_mic()
         self.stop_speaker()
+

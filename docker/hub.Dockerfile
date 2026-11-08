@@ -38,6 +38,7 @@ RUN pip install uv
 
 # Runtime deps for audio I/O
 RUN apt-get update && apt-get install -y \
+    libspeexdsp-dev \
     libportaudio2 \
     libstdc++6 \
     libglib2.0-0 \
