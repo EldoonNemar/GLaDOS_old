@@ -43,3 +43,11 @@ echo "  glados-spoke --hub <hub-ip> --port <port>"
 echo ""
 echo "Or with config file:"
 echo "  glados-spoke --config spoke_config.yaml"
+echo ""
+
+# Run audio device setup
+read -p "Configure audio devices and PipeWire AEC? (y/N) " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    bash "$SCRIPT_DIR/audio_device_setup.sh"
+fi
