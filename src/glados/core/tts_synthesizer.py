@@ -1,5 +1,6 @@
 from collections.abc import Callable
 import queue
+import re
 import threading
 import time
 
@@ -108,7 +109,9 @@ class TextToSpeechSynthesizer:
                             )
 
                         start_time = time.time()
-                        spoken_text_variant = self.stc.text_to_spoken(segment.text)
+                        # Strip emotion tags before TTS so they don't get spoken
+                        spoken_segment = re.sub(r'\[emotion(:[^]]*)?\]', '', segment.text)
+                        spoken_text_variant = self.stc.text_to_spoken(spoken_segment)
                         if self._tts_muted_event and self._tts_muted_event.is_set():
                             audio_data = np.array([], dtype=np.float32)
                         else:

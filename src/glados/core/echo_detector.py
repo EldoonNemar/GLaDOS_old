@@ -23,8 +23,8 @@ class EchoDetector:
 
     def __init__(
         self,
-        similarity_threshold: float = 0.7,
-        min_length: int = 4,
+        similarity_threshold: float = 0.85,
+        min_length: int = 6,
         recent_turns: int = 3,
         bus: ObservabilityBus | None = None,
     ) -> None:

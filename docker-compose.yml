@@ -35,7 +35,7 @@ services:
       - "-c"
       - "65536"
       - "--parallel"
-      - "4"
+      - "2"
       - "-ngl"
       - "99"
     networks:

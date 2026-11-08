@@ -2,12 +2,12 @@ Glados:
   llm_model: "llama3.2"
   completion_url: "http://localhost:11434/api/chat"
   api_key: null  # Add your API key here if needed!
-  interruptible: true
+  interruptible: false
   audio_io: "websocket"
   audio_io_options:
     server: "0.0.0.0"   # WebSocket listen address
     port: 5051            # WebSocket listen port
-    vad_threshold: 0.01    # Very low for weak built-in laptop mic
+    vad_threshold: 0.3    # Very low for weak built-in laptop mic
     rooms: false          # multi-microphone room choreography (off by default)
     segregate_speakers: false
     default_room_tag: "office"
@@ -18,11 +18,11 @@ Glados:
   tui_theme: "aperture"
   asr_engine: "tdt"
   llm_headers: null  # Optional extra headers (e.g., OpenRouter HTTP-Referer, X-Title)
-  wake_word: null
+  wake_word: "glados"
   voice: "glados"
   announcement: "All neural network modules are now loaded. System Operational."
   autonomy:
-    enabled: true
+    enabled: false
     tick_interval_s: 10
     cooldown_s: 20
     autonomy_parallel_calls: 2

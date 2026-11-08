@@ -22,7 +22,7 @@ Glados:
     chat_template_kwargs:
       enable_thinking: false
   api_key: null  # Add your API key here if needed!
-  interruptible: true
+  interruptible: false
   audio_io: "sounddevice"
   input_mode: "audio"  # audio, text, or both
   tts_enabled: true
