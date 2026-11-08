@@ -140,7 +140,18 @@ class SpokeAudio:
             return
 
         if self._aec is not None and len(self._playback_ref) >= self._aec.frame_size:
-            samples = self._aec.process(samples, self._playback_ref)
+            # Resample reference to mic rate so AEC can process it
+            if self.spk_sample_rate != self.mic_sample_rate:
+                from scipy import signal as scipy_signal
+                divisor = math.gcd(self.mic_sample_rate, self.spk_sample_rate)
+                ref = scipy_signal.resample_poly(
+                    self._playback_ref,
+                    self.mic_sample_rate // divisor,
+                    self.spk_sample_rate // divisor,
+                ).astype(np.float32)
+            else:
+                ref = self._playback_ref
+            samples = self._aec.process(samples, ref)
         if self._callback:
             self._callback(samples)
 
@@ -172,14 +183,10 @@ class SpokeAudio:
             return
         if self._spk_stream is None:
             return  # No speaker available
-        if self.spk_sample_rate != self.MIC_SAMPLE_RATE:
-            from scipy import signal as scipy_signal
-            divisor = math.gcd(self.MIC_SAMPLE_RATE, self.spk_sample_rate)
-            samples = scipy_signal.resample_poly(
-                samples, self.spk_sample_rate // divisor, self.MIC_SAMPLE_RATE // divisor,
-            ).astype(np.float32)
-        self._playback_ref = samples
-        self._aec.update_reference(samples)
+        # Store original (unresampled) samples as the AEC reference.
+        # sd.play() will handle resampling internally; the AEC resamples
+        # the reference to the mic rate in the callback.
+        self._playback_ref = samples.astype(np.float32)
         try:
             sd.play(samples, self.spk_sample_rate, blocking=False)
         except Exception:
