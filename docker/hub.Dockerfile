@@ -41,6 +41,8 @@ RUN apt-get update && apt-get install -y \
     libspeexdsp-dev \
     libportaudio2 \
     libstdc++6 \
+    swig \
+    g++-base \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 

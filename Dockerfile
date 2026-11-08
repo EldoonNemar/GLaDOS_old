@@ -5,6 +5,8 @@ RUN apt-get update && apt-get install -y \
   portaudio19-dev \
   libspeexdsp-dev \
   libgl1 \
+  swig \
+  g++ \
   libglib2.0-0 \
   git \
   && rm -rf /var/lib/apt/lists/*
