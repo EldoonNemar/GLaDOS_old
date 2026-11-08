@@ -66,6 +66,72 @@ class SpeexAEC:
         return cleaned
 
 
+# --- Lightweight MFCC-based audio similarity (no extra deps) ---
+
+_MFCC_N_MFCC = 13
+_MFCC_N_FFT = 512
+_MFCC_HOP = 256
+_MFCC_N_MELS = 40
+
+
+def _mel_weights(n_mels: int = _MFCC_N_MELS, n_fft: int = _MFCC_N_FFT,
+                 sr: int = 16000) -> NDArray[np.float64]:
+    """Compute triangular mel filterbank weights."""
+    # Convert mel to Hz
+    mel_low = 0.0
+    mel_high = 2595.0 * math.log10(1.0 + (sr / 2.0) / 700.0)
+    mel_points = np.linspace(mel_low, mel_high, n_mels + 2)
+    freq_points = 700.0 * (10.0 ** (mel_points / 2595.0) - 1.0)
+
+    bin_indices = np.floor((n_fft + 1) * freq_points / sr)
+    weights = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float64)
+
+    for m in range(n_mels):
+        f_m = int(bin_indices[m])
+        f_m1 = int(bin_indices[m + 1])
+        f_m2 = int(bin_indices[m + 2])
+
+        if f_m2 > f_m1:
+            weights[m, f_m1:f_m2] = np.linspace(0, 1, f_m2 - f_m1)
+        if f_m1 > f_m:
+            weights[m, f_m:f_m1] = np.linspace(1, 0, f_m1 - f_m)
+
+    return weights
+
+
+def _mfcc(audio: NDArray[np.float32], n_mfcc: int = _MFCC_N_MFCC) -> NDArray[np.float64]:
+    """Extract simplified MFCC features from an audio sample."""
+    n_fft = _MFCC_N_FFT
+    # Short-time Fourier transform
+    window = np.hanning(len(audio) + 1)[:len(audio)]
+    stft = np.abs(np.fft.rfft(audio * window, n_fft)) ** 2
+
+    # Apply mel filterbank
+    fb = _mel_weights()
+    energy = fb @ stft
+
+    # Log energy with floor
+    log_energy = np.log10(np.maximum(energy, 1e-10))
+
+    # Discrete cosine transform → MFCCs
+    dct = np.fft.dct(log_energy, type=2, axis=0)
+    return dct[:n_mfcc]
+
+
+def _audio_similarity(a: NDArray[np.float32], b: NDArray[np.float32]) -> float:
+    """Cosine similarity between MFCC fingerprints of two audio clips."""
+    mfcc_a = _mfcc(a)
+    mfcc_b = _mfcc(b)
+
+    norm_a = math.sqrt(float(np.dot(mfcc_a, mfcc_a)))
+    norm_b = math.sqrt(float(np.dot(mfcc_b, mfcc_b)))
+
+    if norm_a < 1e-10 or norm_b < 1e-10:
+        return 0.0
+
+    return float(np.dot(mfcc_a, mfcc_b)) / (norm_a * norm_b)
+
+
 class SpokeAudio:
     """Manages local mic capture and speaker playback."""
 
@@ -139,8 +205,11 @@ class SpokeAudio:
         elif peak < 0.01 and len(samples) > 0:  # Skip very quiet audio
             return
 
-        if self._aec is not None and len(self._playback_ref) >= self._aec.frame_size:
-            # Resample reference to mic rate so AEC can process it
+        # --- Echo detection: compare mic audio with recent speaker output ---
+        if (self._aec is not None
+                and len(self._playback_ref) >= self._aec.frame_size
+                and self.spk_sample_rate >= 16000):
+            # Resample reference to mic rate
             if self.spk_sample_rate != self.mic_sample_rate:
                 from scipy import signal as scipy_signal
                 divisor = math.gcd(self.mic_sample_rate, self.spk_sample_rate)
@@ -151,7 +220,21 @@ class SpokeAudio:
                 ).astype(np.float32)
             else:
                 ref = self._playback_ref
-            samples = self._aec.process(samples, ref)
+
+            # Check if mic audio matches the speaker reference (echo)
+            if len(ref) >= self._aec.frame_size:
+                ref_slice = ref[:self._aec.frame_size]
+                if _audio_similarity(samples, ref_slice) > 0.70:
+                    logger.debug("Spoke echo detected — suppressing mic frame")
+                    # Still pass the frame but zero it out to prevent hub from
+                    # hearing GLaDOS's own voice (catches cases where AEC missed)
+                    samples = np.zeros_like(samples)
+
+            # Run AEC on the (possibly suppressed) audio
+            if self._aec is not None and len(ref) >= self._aec.frame_size:
+                samples = self._aec.process(samples, ref)
+        elif self._aec is not None and len(self._playback_ref) >= self._aec.frame_size:
+            samples = self._aec.process(samples, self._playback_ref)
         if self._callback:
             self._callback(samples)
 
