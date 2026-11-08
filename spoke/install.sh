@@ -11,6 +11,12 @@ echo "=== GLaDOS Spoke Installer ==="
 
 # Install system dependencies
 echo "Installing system dependencies..."
+echo "NOTE: This requires sudo privileges. You may need to run this script with sudo."
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Re-running with sudo..."
+    exec sudo "$0" "$@"
+fi
+
 apt-get update && apt-get install -y libspeex-dev libspeexdsp-dev libasound2-dev libportaudio2 libstdc++6 python3-venv swig g++
 
 # Check if venv already exists
