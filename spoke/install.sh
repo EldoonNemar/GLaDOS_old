@@ -11,7 +11,7 @@ echo "=== GLaDOS Spoke Installer ==="
 
 # Install system dependencies
 echo "Installing system dependencies..."
-apt-get update && apt-get install -y libportaudio2 libspeexdsp-dev libstdc++6 python3-venv swig g++
+apt-get update && apt-get install -y libspeex-dev libspeexdsp-dev libasound2-dev libportaudio2 libstdc++6 python3-venv swig g++
 
 # Check if venv already exists
 if [ -d "$VENV_DIR" ]; then
