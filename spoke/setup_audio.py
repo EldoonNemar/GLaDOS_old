@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Universal GLaDOS Spoke audio device auto-detection.
+"""Smart GLaDOS Spoke audio device auto-detection.
 
-Works on ANY Linux with ALSA, regardless of distro or hardware.
+Two-phase detection (mirrors human hearing):
+1. FIND THE MIC: Probe all capture devices, pick the best one
+   - USB headset preferred
+   - Falls back to highest ambient sound level
+2. FIND THE SPEAKER: Play tone through each playback device,
+   record with the chosen mic. The device the mic hears is the answer.
+3. LOOPBACK VERIFY: Confirm the pair works together.
 
-Method: brute-force probe every hw:card,device combination.
-1. Get card count from /proc/asound/cards (or default to 8)
-2. For each card, probe devices 0-3 for capture and playback
-3. Test each device at required sample rates
-4. Loopback test: play tone, mic records it — confirms the pair works
-
-No assumptions. No hardcoded defaults. Works everywhere.
+No brute-force all-pairs. No assumptions. Fast and reliable.
 
 Usage:
-    python setup_audio.py --auto    # full auto-detect
-    python setup_audio.py           # interactive
-    python setup_audio.py --list    # list detected devices
+    python setup_audio.py --auto
+    python setup_audio.py
+    python setup_audio.py --list
 """
 
 from __future__ import annotations
@@ -74,7 +74,6 @@ def get_card_name(card: int) -> str:
 
 
 def kill_speaker_test(hw: str) -> None:
-    """Kill any leftover speaker-test processes for a device."""
     try:
         subprocess.run(["pkill", "-f", f"speaker-test.*{hw}"],
                        capture_output=True, timeout=2)
@@ -82,17 +81,50 @@ def kill_speaker_test(hw: str) -> None:
         pass
 
 
-def probe_devices(card_count: int) -> list[dict]:
+def find_capture_devices(card_count: int) -> list[dict]:
     devices = []
-
     for card in range(card_count):
         card_name = get_card_name(card)
-
         for dev in range(MAX_DEVICES_PER_CARD):
             hw = f"hw:{card},{dev}"
+            tmp = f"/tmp/glados-capture-test.wav"
+            try:
+                p = subprocess.Popen(
+                    ["arecord", "-D", hw, "-f", "S16_LE", "-r", "16000",
+                     "-c", "1", "-d", "1", tmp],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                p.wait(timeout=5)
+                if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                    with open(tmp, "rb") as f:
+                        f.read(44)
+                        raw = f.read()
+                    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                    peak = float(np.max(np.abs(samples)))
+                    devices.append({
+                        "hw": hw,
+                        "name": f"{card_name} (hw:{card},{dev}) [in]",
+                        "card": card,
+                        "device": dev,
+                        "is_capture": True,
+                        "is_playback": False,
+                        "ambient_peak": peak,
+                    })
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                pass
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    return devices
 
-            # Test playback
-            is_playback = False
+
+def find_playback_devices(card_count: int) -> list[dict]:
+    devices = []
+    for card in range(card_count):
+        card_name = get_card_name(card)
+        for dev in range(MAX_DEVICES_PER_CARD):
+            hw = f"hw:{card},{dev}"
             try:
                 p = subprocess.Popen(
                     ["speaker-test", "-t", "silence", "-l", "0",
@@ -101,42 +133,17 @@ def probe_devices(card_count: int) -> list[dict]:
                     start_new_session=True)
                 p.wait(timeout=3)
                 if p.returncode == 0:
-                    is_playback = True
+                    devices.append({
+                        "hw": hw,
+                        "name": f"{card_name} (hw:{card},{dev}) [out]",
+                        "card": card,
+                        "device": dev,
+                        "is_capture": False,
+                        "is_playback": True,
+                    })
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 pass
             kill_speaker_test(hw)
-
-            # Test capture
-            is_capture = False
-            tmp = f"/tmp/glados-probe-{card}-{dev}.wav"
-            try:
-                p = subprocess.Popen(
-                    ["arecord", "-D", hw, "-f", "S16_LE", "-r", "16000",
-                     "-c", "1", "-d", "1", tmp],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                p.wait(timeout=5)
-                is_capture = os.path.exists(tmp) and os.path.getsize(tmp) > 0
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                pass
-            finally:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-
-            if is_playback or is_capture:
-                name = f"{card_name} (hw:{card},{dev})"
-                if is_playback and is_capture:
-                    name += " [in+out]"
-                elif is_playback:
-                    name += " [out]"
-                elif is_capture:
-                    name += " [in]"
-                devices.append({
-                    "hw": hw, "name": name, "card": card, "device": dev,
-                    "is_capture": is_capture, "is_playback": is_playback,
-                })
-
     return devices
 
 
@@ -162,41 +169,117 @@ def print_devices(devices: list[dict]) -> None:
         sys.exit(1)
 
 
-def test_rate(hw: str, rate: int, is_capture: bool) -> bool:
-    try:
-        if is_capture:
-            tmp = f"/tmp/glados-rate-{rate}.wav"
+def select_mic(mics: list[dict]) -> str:
+    print("\n=== Finding Microphone ===")
+
+    usb_mic = next((m for m in mics if "usb" in m["name"].lower()), None)
+    if usb_mic:
+        print(f"  Found USB mic: {usb_mic['hw']}")
+        print("  Verifying...")
+        tmp = f"/tmp/glados-mic-test.wav"
+        try:
             p = subprocess.Popen(
-                ["arecord", "-D", hw, "-r", str(rate), "-f", "S16_LE",
-                 "-c", "1", "-d", "1", tmp],
+                ["arecord", "-D", usb_mic['hw'], "-f", "S16_LE", "-r", "16000",
+                 "-c", "1", "-d", "2", tmp],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             p.wait(timeout=5)
-            ok = p.returncode == 0
-            try:
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                with open(tmp, "rb") as f:
+                    f.read(44)
+                    raw = f.read()
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                peak = float(np.max(np.abs(samples)))
                 os.unlink(tmp)
-            except OSError:
-                pass
-        else:
-            p = subprocess.Popen(
-                ["speaker-test", "-t", "silence", "-r", str(rate),
-                 "-l", "0", "-c", "2", "-D", hw],
+                if peak > 10:
+                    print(f"  USB mic works (ambient peak: {peak:.0f})")
+                    return usb_mic['hw']
+                print(f"  USB mic too quiet (peak: {peak:.0f}), trying others...")
+            else:
+                print("  USB mic recorded nothing")
+        except Exception as e:
+            print(f"  USB mic error: {e}")
+
+    if len(mics) > 1:
+        mics_sorted = sorted(mics, key=lambda m: m.get("ambient_peak", 0), reverse=True)
+        peaks = [f"{m['ambient_peak']:.0f}" for m in mics_sorted]
+        print(f"  Ambient levels: {peaks}")
+        best = mics_sorted[0]
+        print(f"  Selected: {best['hw']} (peak: {best['ambient_peak']:.0f})")
+    else:
+        best = mics[0]
+        print(f"  Selected: {best['hw']}")
+
+    return best['hw']
+
+
+def select_speaker(speakers: list[dict], mic_hw: str) -> str:
+    print("\n=== Finding Speaker ===")
+    print("  Playing 1kHz tone through each speaker while mic records...\n")
+
+    best_spk = None
+    best_peak = 0
+
+    for i, spk in enumerate(speakers):
+        hw = spk["hw"]
+        print(f"  Speaker {i+1}/{len(speakers)}: {hw}", end="")
+
+        output = f"/tmp/glados-spk-test-{i}.wav"
+        try:
+            spk_proc = subprocess.Popen(
+                ["speaker-test", "-t", "sine", "-f", "1000", "-l", "1",
+                 "-c", "2", "-D", hw],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
-            p.wait()
-            ok = p.returncode == 0
-            kill_speaker_test(hw)
-        return ok
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
+
+            rec_proc = subprocess.Popen(
+                ["arecord", "-D", mic_hw, "-f", "S16_LE", "-r", "16000",
+                 "-c", "1", "-d", "3", output],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            rec_proc.wait(timeout=8)
+
+            spk_proc.terminate()
+            try:
+                spk_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                spk_proc.kill()
+
+            if os.path.exists(output) and os.path.getsize(output) > 0:
+                with open(output, "rb") as f:
+                    f.read(44)
+                    raw = f.read()
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                peak = float(np.max(np.abs(samples)))
+
+                if peak > 50:
+                    print(f"  heard by mic (peak: {peak:.0f})")
+                    if peak > best_peak:
+                        best_peak = peak
+                        best_spk = hw
+                else:
+                    print(f"  too quiet (peak: {peak:.0f})")
+            else:
+                print("  no recording")
+
+        except Exception as e:
+            print(f"  error: {e}")
+        finally:
+            try:
+                os.unlink(output)
+            except OSError:
+                pass
+
+    if best_spk:
+        print(f"\n  Speaker found: {best_spk} (peak: {best_peak:.0f})")
+    else:
+        print("\n  No speaker detected by mic.")
+        print("  Try interactive mode: glados-spoke setup")
+        sys.exit(1)
+
+    return best_spk
 
 
-def test_rates(hw: str, is_capture: bool) -> list[int]:
-    return [r for r in [8000, 11025, 16000, 22050, 44100, 48000]
-            if test_rate(hw, r, is_capture)]
-
-
-def loopback_test(speaker_hw: str, mic_hw: str) -> tuple[bool, float]:
-    output = "/tmp/glados-loopback.wav"
+def loopback_verify(speaker_hw: str, mic_hw: str) -> tuple[bool, float]:
+    output = "/tmp/glados-loopback-verify.wav"
     try:
         spk = subprocess.Popen(
             ["speaker-test", "-t", "sine", "-f", "1000", "-l", "1",
@@ -217,11 +300,11 @@ def loopback_test(speaker_hw: str, mic_hw: str) -> tuple[bool, float]:
         if not os.path.exists(output):
             return False, 0.0
 
-        import wave
-        with wave.open(output) as wf:
-            frames = wf.readframes(wf.getnframes())
-            samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
-            peak = float(np.max(np.abs(samples)))
+        with open(output, "rb") as f:
+            f.read(44)
+            raw = f.read()
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+        peak = float(np.max(np.abs(samples)))
         return peak >= 50, peak
 
     except Exception:
@@ -233,54 +316,36 @@ def loopback_test(speaker_hw: str, mic_hw: str) -> tuple[bool, float]:
             pass
 
 
-def find_best_pair(speakers: list[dict], mics: list[dict]) -> tuple[str, str, float]:
-    print(f"\n  Testing {len(speakers)} speakers x {len(mics)} mics...\n")
-    best_spk = best_mic = None
-    best_peak = 0
-
-    for i, spk in enumerate(speakers):
-        print(f"  Speaker {i+1}/{len(speakers)}: {spk['hw']}")
-        for j, mic in enumerate(mics):
-            print(f"    Mic {j+1}/{len(mics)}: {mic['hw']}... ", end="")
-            ok, peak = loopback_test(spk["hw"], mic["hw"])
-            if ok:
-                print(f"✓ peak={peak:.0f}")
-                if peak > best_peak:
-                    best_peak = peak
-                    best_spk = spk["hw"]
-                    best_mic = mic["hw"]
+def test_rates(hw: str, is_capture: bool) -> list[int]:
+    rates = []
+    for rate in [8000, 16000, 22050, 44100, 48000]:
+        try:
+            if is_capture:
+                tmp = f"/tmp/glados-rate-{rate}.wav"
+                p = subprocess.Popen(
+                    ["arecord", "-D", hw, "-r", str(rate), "-f", "S16_LE",
+                     "-c", "1", "-d", "1", tmp],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                p.wait(timeout=5)
+                if p.returncode == 0:
+                    rates.append(rate)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
             else:
-                print("✗ quiet")
-        print()
-
-    if best_spk:
-        print(f"  ✓ Best: Speaker={best_spk}, Mic={best_mic} (peak: {best_peak:.0f})")
-    else:
-        print("  ✗ No working pair found")
-    return best_spk or speakers[0]["hw"], best_mic or mics[0]["hw"], best_peak
-
-
-def auto_detect(devices: list[dict]) -> tuple[str, str, list[int], list[int]]:
-    speakers = [d for d in devices if d["is_playback"]]
-    mics = [d for d in devices if d["is_capture"]]
-
-    usb_spk = next((d for d in speakers if "usb" in d["name"].lower()), None)
-    usb_mic = next((d for d in mics if "usb" in d["name"].lower()), None)
-
-    if usb_spk and usb_mic:
-        print("\n  USB headset found, testing...")
-        print(f"  Speaker: {usb_spk['hw']}")
-        print(f"  Mic:     {usb_mic['hw']}")
-        ok, peak = loopback_test(usb_spk["hw"], usb_mic["hw"])
-        if ok:
-            print(f"  ✓ USB headset works (peak: {peak:.0f})")
-            spk_rates = test_rates(usb_spk["hw"], False)
-            mic_rates = test_rates(usb_mic["hw"], True)
-            return usb_spk["hw"], usb_mic["hw"], spk_rates or [22050, 44100], mic_rates or [16000]
-        print("  USB loopback failed, testing all pairs...")
-
-    spk_hw, mic_hw, _ = find_best_pair(speakers, mics)
-    return spk_hw, mic_hw, test_rates(spk_hw, False) or [22050, 44100], test_rates(mic_hw, True) or [16000]
+                p = subprocess.Popen(
+                    ["speaker-test", "-t", "silence", "-r", str(rate),
+                     "-l", "0", "-c", "2", "-D", hw],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True)
+                p.wait()
+                if p.returncode == 0:
+                    rates.append(rate)
+                kill_speaker_test(hw)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+    return rates
 
 
 def write_config(spk_hw: str, mic_hw: str, spk_rates: list[int],
@@ -338,19 +403,31 @@ def main() -> None:
     print(f"\n=== GLaDOS Spoke Audio Setup ===")
     print(f"Detected {card_count} ALSA cards\n")
 
-    devices = probe_devices(card_count)
-    if not devices:
-        print("ERROR: No audio devices found.")
-        print("Check that your USB headset is plugged in.")
+    capture_devices = find_capture_devices(card_count)
+    playback_devices = find_playback_devices(card_count)
+
+    if not capture_devices or not playback_devices:
+        print("ERROR: No usable audio devices found.")
+        print("Check that your USB headset is plugged in and recognized.")
         sys.exit(1)
 
+    devices = capture_devices + playback_devices
     print_devices(devices)
-    speakers = [d for d in devices if d["is_playback"]]
-    mics = [d for d in devices if d["is_capture"]]
 
     if args.auto:
-        spk_hw, mic_hw, spk_rates, mic_rates = auto_detect(devices)
+        mic_hw = select_mic(capture_devices)
+        spk_hw = select_speaker(playback_devices, mic_hw)
+        print("\n=== Verifying Pair ===")
+        ok, peak = loopback_verify(spk_hw, mic_hw)
+        if ok:
+            print(f"  Verified (peak: {peak:.0f})")
+        else:
+            print("  Verification failed. The mic didn't hear the speaker.")
+            print("  Try interactive mode: glados-spoke setup")
+            sys.exit(1)
     else:
+        speakers = [d for d in devices if d["is_playback"]]
+        mics = [d for d in devices if d["is_capture"]]
         print("Select speaker index:")
         for i, d in enumerate(speakers):
             print(f"  {i}: {d['hw']}")
@@ -360,22 +437,21 @@ def main() -> None:
             print(f"  {i}: {d['hw']}")
         mic_hw = mics[int(input("  > "))]["hw"]
         print("\n  Testing selected pair with loopback...")
-        ok, peak = loopback_test(spk_hw, mic_hw)
+        ok, peak = loopback_verify(spk_hw, mic_hw)
         if ok:
-            print(f"  ✓ Loopback test passed (peak: {peak:.0f})")
+            print(f"  Verified (peak: {peak:.0f})")
         else:
-            print(f"  ✗ Loopback test FAILED. Selecting best pair...")
-            spk_hw, mic_hw, _ = find_best_pair(speakers, mics)
-        spk_rates = test_rates(spk_hw, False)
-        mic_rates = test_rates(mic_hw, True)
+            print("  Verification failed. Try selecting a different pair.")
+            sys.exit(1)
 
-    spk_rates = spk_rates or [22050, 44100]
-    mic_rates = mic_rates or [16000]
+    spk_rates = test_rates(spk_hw, False)
+    mic_rates = test_rates(mic_hw, True)
 
-    write_config(spk_hw, mic_hw, spk_rates, mic_rates, args.config)
-    print(f"\n✓ Config written: {args.config}")
-    print(f"  Speaker: {spk_hw}  (rates: {spk_rates})")
-    print(f"  Mic:     {mic_hw}  (rates: {mic_rates})")
+    write_config(spk_hw, mic_hw, spk_rates or [22050, 44100],
+                 mic_rates or [16000], args.config)
+    print(f"\nConfig written: {args.config}")
+    print(f"  Speaker: {spk_hw}  (rates: {spk_rates or [22050, 44100]})")
+    print(f"  Mic:     {mic_hw}  (rates: {mic_rates or [16000]})")
     print(f"\nRun: glados-spoke --config {args.config}")
 
 
