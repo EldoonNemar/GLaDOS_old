@@ -22,27 +22,32 @@ logger = logging.getLogger(__name__)
 
 
 def _make_wav_header(num_samples: int, sample_rate: int = 22050, channels: int = 1) -> bytes:
-    """Create a minimal WAV header for raw float32 audio."""
+    """Create a minimal WAV header for raw float32 audio.
+
+    Uses IEEE float format (0x0003) which requires an 18-byte fmt subchunk
+    (the standard 16 bytes + 2-byte cbSize field).
+    """
     byte_rate = sample_rate * channels * 4  # 4 bytes per float32
     block_align = channels * 4
     data_size = num_samples * block_align
     header = struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
+        "<4sI4s4sIHHIIHHH4sI",
         b"RIFF",
         36 + data_size,
         b"WAVE",
         b"fmt ",
-        16,
-        3,  # float
+        18,          # fmt subchunk size: 16 + 2 (cbSize)
+        3,           # 0x0003 = IEEE float
         channels,
         sample_rate,
         byte_rate,
         block_align,
-        32,
+        32,          # bits per sample for float32
+        0,           # cbSize (extra bytes, 0 for IEEE float)
         b"data",
         data_size,
     )
-    assert len(header) == 44
+    assert len(header) == 46
     return header
 
 
@@ -250,11 +255,14 @@ class SpeakerClient(ReconnectingWS):
         """Build the aplay command.
         
         Uses plughw:{spk_device},0 so audio goes to the correct USB headset.
+        Falls back to the system default (\"default\") if the configured device
+        is unavailable, and logs the device being used for debugging.
         """
         if self.spk_device is not None:
             dev = f"plughw:{self.spk_device},0" if isinstance(self.spk_device, int) else str(self.spk_device)
         else:
-            dev = "plughw:4,0"  # default to USB headset
+            dev = "default"  # use ALSA default device instead of hardcoded index
+        logger.info("Speaker: using audio device %s", dev)
         return ["aplay", "-D", dev, "-f", "S16_LE", "-r", "22050", "-c", "1"]
 
     async def _play(self, data: bytes, sample_rate: int) -> None:
@@ -270,18 +278,31 @@ class SpeakerClient(ReconnectingWS):
             ["sox", "-t", "wav", "-", "-t", "raw", "-r", "22050", "-c", "1", "-b", "16", "-e", "signed-integer", "-"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
         aplay = subprocess.Popen(
             aplay_cmd,
             stdin=proc.stdout,
+            stderr=subprocess.PIPE,
         )
         try:
             proc.stdin.write(wav)
             proc.stdin.close()
             proc.wait(timeout=60)
             aplay.wait(timeout=60)
+            if aplay.returncode != 0:
+                _, aplay_stderr = aplay.communicate()
+                logger.error("Speaker: aplay failed (rc=%d): %s", aplay.returncode, aplay_stderr.decode(errors="replace"))
+            if proc.returncode != 0:
+                _, proc_stderr = proc.communicate()
+                logger.error("Speaker: sox failed (rc=%d): %s", proc.returncode, proc_stderr.decode(errors="replace"))
         except Exception:
             logger.exception("Speaker: playback error")
+            try:
+                _, aplay_stderr = aplay.communicate(timeout=5)
+                logger.error("Speaker: aplay stderr: %s", aplay_stderr.decode(errors="replace"))
+            except Exception:
+                pass
         finally:
             proc.kill()
             aplay.kill()
