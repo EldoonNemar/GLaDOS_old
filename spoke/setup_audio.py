@@ -75,14 +75,18 @@ def kill_speaker_test(hw: str) -> None:
         pass
 
 
-def test_capture_device(hw: str, duration: int = 2) -> tuple[bool, float, str]:
-    """Test if a capture device works and picks up sound.
+def test_capture_device(hw: str, duration: int = 3) -> tuple[bool, float, str]:
+    """Test if a capture device works.
+
+    Records for duration seconds. Requires:
+    - File created with size > 100 bytes (WAV header + some data)
+    - Peak > 50 (real audio, not electrical noise)
+    - No ALSA errors
 
     Returns (success, peak, error_msg).
     """
     tmp = f"/tmp/glados-capture-{hw.replace(',', '-')}.wav"
     try:
-        # Remove old file
         try:
             os.unlink(tmp)
         except OSError:
@@ -96,32 +100,33 @@ def test_capture_device(hw: str, duration: int = 2) -> tuple[bool, float, str]:
         stdout, stderr = p.communicate(timeout=duration + 3)
         rc = p.returncode
 
-        # Check for ALSA errors in stderr
         stderr_str = stderr.decode(errors="replace") if stderr else ""
         if "Device or resource busy" in stderr_str or "No such device" in stderr_str:
-            return False, 0, f"ALSA error: {stderr_str.strip()}"
+            return False, 0, f"ALSA error"
+        if "Access nonexistent device" in stderr_str or "Invalid argument" in stderr_str:
+            return False, 0, "Invalid device"
 
-        # Check file
         if not os.path.exists(tmp):
             return False, 0, "File not created"
 
         file_size = os.path.getsize(tmp)
-        if file_size <= 44:
-            return False, 0, f"File too small ({file_size} bytes)"
+        if file_size <= 100:
+            return False, 0, f"File too small ({file_size}b)"
 
-        # Read audio and get peak
         with open(tmp, "rb") as f:
-            f.read(44)  # skip WAV header
+            f.read(44)
             raw = f.read()
 
-        if len(raw) < 4:
+        if len(raw) < 8:
             return False, 0, "No audio data"
 
         samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
         peak = float(np.max(np.abs(samples)))
 
-        if peak < 1:
-            return False, peak, "Too quiet (peak < 1)"
+        # USB/Conference mics typically pick up 100-5000+ when room noise present
+        # Electrical noise/hdmi-in typically < 50
+        if peak < 50:
+            return False, peak, f"Too quiet (peak: {peak:.0f})"
 
         return True, peak, ""
 
@@ -136,18 +141,21 @@ def test_capture_device(hw: str, duration: int = 2) -> tuple[bool, float, str]:
             pass
 
 
+def is_usb_device(card_name: str) -> bool:
+    """Check if device is USB-based (conference mic, USB headset, etc.)."""
+    lower = card_name.lower()
+    return ("usb" in lower or "pdp" in lower or "jabra" in lower or
+            "plantronics" in lower or "logitech" in lower or
+            "blue" in lower or "steelseries" in lower)
+
+
 def find_working_mic(card_count: int) -> dict | None:
-    """Find the mic that actually picks up sound.
-
-    USB headsets and conference mics preferred.
-    Falls back to whichever device has the highest ambient level.
-    """
+    """Find the mic that actually picks up sound."""
     print("\n=== Phase 1: Finding Microphone ===")
-    print("Recording 2 seconds of ambient sound from each device...\n")
+    print("Recording 3 seconds of ambient sound from each device...\n")
 
-    best_mic = None
-    best_peak = 0
-    found_any = False
+    usb_mics = []
+    other_mics = []
 
     for card in range(card_count):
         card_name = get_card_name(card)
@@ -157,46 +165,48 @@ def find_working_mic(card_count: int) -> dict | None:
             success, peak, err = test_capture_device(hw)
 
             if success:
-                found_any = True
-                is_usb = "usb" in card_name.lower() or "pdp" in card_name.lower()
+                is_usb = is_usb_device(card_name)
                 usb_mark = " [USB/Conference]" if is_usb else ""
-                print(f"  ✓ {hw} ({card_name}){usb_mark} peak={peak:.0f}")
+                status = "✓"
 
-                # Prefer USB/conference mics
-                if is_usb and peak > 5:
-                    best_mic = {
-                        "hw": hw,
-                        "name": f"{card_name} (hw:{card},{dev}) [in] {usb_mark}",
-                    }
-                    print(f"    -> Selected (USB conference mic)")
-                    return best_mic
+                entry = {
+                    "hw": hw,
+                    "name": f"{card_name} (hw:{card},{dev}) [in]",
+                    "peak": peak,
+                    "is_usb": is_usb,
+                    "usb_mark": usb_mark,
+                }
 
-                if peak > best_peak:
-                    best_peak = peak
-                    best_mic = {
-                        "hw": hw,
-                        "name": f"{card_name} (hw:{card},{dev}) [in]",
-                    }
+                if is_usb:
+                    usb_mics.append(entry)
+                    print(f"  {status} {hw} ({card_name}){usb_mark} peak={peak:.0f} [USB PREFERRED]")
+                else:
+                    other_mics.append(entry)
+                    print(f"  - {hw} ({card_name}){usb_mark} peak={peak:.0f}")
             else:
-                if err:
-                    print(f"  - {hw}: {err}")
+                print(f"  . {hw}: {err}")
 
-    if found_any and best_mic:
-        print(f"\n  Selected: {best_mic['hw']} (peak: {best_peak:.0f})")
-        return best_mic
+    # USB mics are ALWAYS preferred over other mics
+    if usb_mics:
+        # Among USB mics, pick the one with highest peak
+        best = max(usb_mics, key=lambda m: m["peak"])
+        print(f"\n  Selected USB mic: {best['hw']} (peak: {best['peak']:.0f})")
+        return best
+
+    if other_mics:
+        # Among other mics, pick the one with highest peak
+        best = max(other_mics, key=lambda m: m["peak"])
+        print(f"\n  Selected: {best['hw']} (peak: {best['peak']:.0f})")
+        return best
 
     print("\n  No working mic found.")
     return None
 
 
 def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
-    """Find which speaker the chosen mic can hear.
-
-    Plays 1kHz tone through each playback device, records with the mic.
-    The device the mic hears is the correct speaker.
-    """
+    """Find which speaker the chosen mic can hear."""
     print("\n=== Phase 2: Finding Speaker ===")
-    print("Playing tone through each speaker, recording with the mic...\n")
+    print("Playing 1kHz tone through each device, recording with the mic...\n")
 
     best_spk = None
     best_peak = 0
@@ -214,21 +224,18 @@ def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
                 except OSError:
                     pass
 
-                # Start speaker test
                 spk = subprocess.Popen(
                     ["speaker-test", "-t", "sine", "-f", "1000", "-l", "1",
                      "-c", "2", "-D", hw],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     start_new_session=True)
 
-                # Record with the mic
                 rec = subprocess.Popen(
                     ["arecord", "-D", mic_hw, "-f", "S16_LE", "-r", "16000",
                      "-c", "1", "-d", "3", output],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 stdout, stderr = rec.communicate(timeout=6)
 
-                # Stop speaker
                 spk.terminate()
                 try:
                     spk.wait(timeout=2)
@@ -236,17 +243,16 @@ def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
                     spk.kill()
                 kill_speaker_test(hw)
 
-                # Check recording
-                if os.path.exists(output) and os.path.getsize(output) > 44:
+                if os.path.exists(output) and os.path.getsize(output) > 100:
                     with open(output, "rb") as f:
                         f.read(44)
                         raw = f.read()
                     samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
                     peak = float(np.max(np.abs(samples)))
 
-                    if peak > 50:
+                    if peak > 100:  # Higher threshold for speaker detection
                         found_any = True
-                        print(f"  ✓ {hw} ({card_name}) heard by mic (peak: {peak:.0f})")
+                        print(f"  ✓ {hw} ({card_name}) heard (peak: {peak:.0f})")
                         if peak > best_peak:
                             best_peak = peak
                             best_spk = {
@@ -267,7 +273,7 @@ def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
                     pass
 
     if found_any and best_spk:
-        print(f"\n  Selected: {best_spk['hw']} (peak: {best_peak:.0f})")
+        print(f"\n  Selected speaker: {best_spk['hw']} (peak: {best_peak:.0f})")
         return best_spk
 
     print("\n  No speaker detected by mic.")
@@ -298,7 +304,7 @@ def loopback_verify(speaker_hw: str, mic_hw: str) -> tuple[bool, float]:
         except subprocess.TimeoutExpired:
             spk.kill()
 
-        if not os.path.exists(output) or os.path.getsize(output) <= 44:
+        if not os.path.exists(output) or os.path.getsize(output) <= 100:
             return False, 0.0
 
         with open(output, "rb") as f:
@@ -306,7 +312,7 @@ def loopback_verify(speaker_hw: str, mic_hw: str) -> tuple[bool, float]:
             raw = f.read()
         samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
         peak = float(np.max(np.abs(samples)))
-        return peak >= 50, peak
+        return peak >= 100, peak
 
     except Exception:
         return False, 0.0
@@ -408,25 +414,20 @@ def main() -> None:
     print(f"\n=== GLaDOS Spoke Audio Setup ===")
     print(f"Detected {card_count} ALSA cards\n")
 
-    # Phase 1: Find the mic
     mic_info = find_working_mic(card_count)
     if not mic_info:
         print("\nERROR: No working microphone found.")
-        print("Check that your conference mic is plugged in and powered.")
         sys.exit(1)
 
     mic_hw = mic_info["hw"]
 
-    # Phase 2: Find the speaker
     spk_info = find_working_speaker(mic_hw, card_count)
     if not spk_info:
         print("\nERROR: No speaker detected by the microphone.")
-        print("Make sure the speakers are plugged in and turned on.")
         sys.exit(1)
 
     spk_hw = spk_info["hw"]
 
-    # Phase 3: Verify
     print("\n=== Phase 3: Verifying Pair ===")
     ok, peak = loopback_verify(spk_hw, mic_hw)
     if ok:
@@ -435,7 +436,6 @@ def main() -> None:
         print("  ✗ Verification failed.")
         sys.exit(1)
 
-    # Test sample rates
     print("\n=== Testing Sample Rates ===")
     spk_rates = test_rates(spk_hw, False)
     mic_rates = test_rates(mic_hw, True)
