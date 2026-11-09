@@ -17,7 +17,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo "$0" "$@"
 fi
 
-apt-get update && apt-get install -y libspeex-dev libspeexdsp-dev libasound2-dev libportaudio2 libstdc++6 python3-venv swig g++ sox
+apt-get update && apt-get install -y libspeex-dev libspeexdsp-dev libasound2-dev libportaudio2 libstdc++6 python3-venv swig g++
 
 # Check if venv already exists
 if [ -d "$VENV_DIR" ]; then
@@ -53,10 +53,41 @@ echo ""
 
 # Run audio device setup
 while true; do
-    read -p "Configure audio devices and PipeWire AEC? (y/N) " -n 1 -r REPLY
+    read -p "Configure audio devices? (y/N) " -n 1 -r REPLY
     echo
     if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-        bash "$SCRIPT_DIR/audio_device_setup.sh"
+        echo ""
+        echo "Choose setup mode:"
+        echo "  1) Auto-detect (recommended - picks USB headset if available)"
+        echo "  2) Interactive (you pick each device)"
+        echo "  3) List devices only"
+        echo "  4) Skip for now"
+        echo ""
+        read -p "Select [1-4] (default: 1) " MODE
+        MODE=${MODE:-1}
+
+        case "$MODE" in
+            1)
+                echo ""
+                echo "--- Auto-detecting audio devices ---"
+                "$VENV_DIR/bin/python" "$SCRIPT_DIR/setup_audio.py" --auto --config "$SCRIPT_DIR/spoke_config.yaml"
+                ;;
+            2)
+                echo ""
+                echo "--- Manual device selection ---"
+                "$VENV_DIR/bin/python" "$SCRIPT_DIR/setup_audio.py" --manual --config "$SCRIPT_DIR/spoke_config.yaml"
+                ;;
+            3)
+                echo ""
+                "$VENV_DIR/bin/python" "$SCRIPT_DIR/setup_audio.py" --list
+                ;;
+            4)
+                echo "Skipping audio setup."
+                ;;
+            *)
+                echo "Invalid option. Skipping audio setup."
+                ;;
+        esac
         break
     elif [[ "$REPLY" =~ ^[Nn]$ ]]; then
         echo "Skipping audio device setup."
