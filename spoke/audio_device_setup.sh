@@ -1,96 +1,46 @@
 #!/usr/bin/env bash
 # GLaDOS Spoke Audio Device Configuration (ALSA)
-# Tests mic first to identify the USB headset, then tests speaker on that card.
+# Automated: finds mic, tests speaker through mic, asks final confirmation.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/spoke_config.yaml"
 
-# =============================================================================
-# Helper: ask yes/no
-# =============================================================================
-ask_yes_no() {
-    local question="$1"
-    local answer="n"
-    while [[ ! "$answer" =~ ^[YyNn]$ ]]; do
-        read -rp "$question [Y/n] " -i "Y" answer
-        answer=${answer:-Y}
-    done
-    [[ "$answer" =~ ^[Yy]$ ]]
-}
-
 echo "=== GLaDOS Spoke Audio Device Setup ==="
 echo ""
 
 # =============================================================================
-# Step 1: Find the USB headset mic (hw:4,0 typically)
+# Step 1: Find the working microphone
 # =============================================================================
-echo "--- Step 1: Identify Microphone ---"
+echo "--- Step 1: Identifying Microphone ---"
 echo ""
 
-# Check if hw:4 (USB headset) exists — it's the most common on Raspberry Pi
-USB_MIC_FOUND=false
-for i in "4" "3" "0"; do
-    if arecord -l 2>/dev/null | grep -q "card $i"; then
-        USB_MIC_FOUND=true
-        break
-    fi
-done
-
-if [ "$USB_MIC_FOUND" = true ]; then
-    SELECTED_MIC="hw:4,0"
-    echo "Detected USB headset mic (hw:4,0). Testing..."
-    echo "Speak into the mic for 3 seconds..."
-    sleep 1
-    arecord -D "hw:4,0" -f S16_LE -r 16000 -c 1 -d 3 /tmp/glados-mic-test.wav 2>/dev/null
-    echo "Playing back your recording..."
-    aplay /tmp/glados-mic-test.wav 2>/dev/null
-    rm -f /tmp/glados-mic-test.wav
-    if ask_yes_no "Did you hear yourself clearly?"; then
-        echo "Confirmed: microphone is $SELECTED_MIC"
-    else
-        echo "USB headset mic didn't work. Scanning for other mics..."
-        SELECTED_MIC=""
-    fi
-fi
-
-if [ -z "${SELECTED_MIC:-}" ]; then
-    echo ""
-    echo "No USB headset detected. Scanning all available mics..."
+# USB headset is typically hw:4 on Raspberry Pi / Orange Pi
+SELECTED_MIC="hw:4,0"
+if arecord -D "$SELECTED_MIC" -f S16_LE -r 16000 -c 1 -d 3 /tmp/glados-mic-test.wav 2>/dev/null && [ -s /tmp/glados-mic-test.wav ]; then
+    echo "USB headset mic (hw:4,0) recorded successfully."
+else
+    echo "hw:4,0 not found or failed. Scanning all mics..."
+    SELECTED_MIC=""
     MIC_DEVICES=()
     while IFS= read -r line; do
         card=$(echo "$line" | grep -oP 'card \K[0-9]+')
         device=$(echo "$line" | grep -oP 'device \K[0-9]+' | head -1)
-        if [ -n "$card" ] && [ -n "$device" ]; then
-            MIC_DEVICES+=("hw:${card},${device}")
-        fi
+        [ -n "$card" ] && [ -n "$device" ] && MIC_DEVICES+=("hw:${card},${device}")
     done < <(arecord -l 2>/dev/null | grep 'device 0:')
 
-    if [ ${#MIC_DEVICES[@]} -eq 0 ]; then
-        echo "No microphones found at all!"
-        SELECTED_MIC="hw:0,0"
-    else
-        for i in "${!MIC_DEVICES[@]}"; do
-            mic="${MIC_DEVICES[$i]}"
-            echo -n "  [${i+1}] Recording from $mic (3 seconds)... "
-            arecord -D "$mic" -f S16_LE -r 16000 -c 1 -d 3 /tmp/glados-mic-test.wav 2>/dev/null &
-            sleep 3
-            kill $! 2>/dev/null || true
-            wait $! 2>/dev/null || true
+    for mic in "${MIC_DEVICES[@]}"; do
+        if arecord -D "$mic" -f S16_LE -r 16000 -c 1 -d 3 /tmp/glados-mic-test.wav 2>/dev/null && [ -s /tmp/glados-mic-test.wav ]; then
+            SELECTED_MIC="$mic"
+            echo "Found working mic: $mic"
+            break
+        fi
+    done
+    rm -f /tmp/glados-mic-test.wav
 
-            if [ -f /tmp/glados-mic-test.wav ]; then
-                echo "listening back..."
-                aplay /tmp/glados-mic-test.wav 2>/dev/null
-                if ask_yes_no "Did you hear your voice?"; then
-                    SELECTED_MIC="$mic"
-                    echo "Confirmed: microphone is $SELECTED_MIC"
-                    break
-                fi
-            else
-                echo "failed to record."
-            fi
-            rm -f /tmp/glados-mic-test.wav
-        done
+    if [ -z "$SELECTED_MIC" ]; then
+        echo "ERROR: No microphone recorded any audio!"
+        exit 1
     fi
 fi
 
@@ -98,74 +48,96 @@ echo "Selected microphone: $SELECTED_MIC"
 echo ""
 
 # =============================================================================
-# Step 2: Find the speaker on the SAME card as the mic
+# Step 2: Find the working speaker on the same card
 # =============================================================================
-echo "--- Step 2: Identify Speaker ---"
+echo "--- Step 2: Identifying Speaker ---"
 echo ""
 
-# Extract the card number from the mic device
-MIC_CARD=$(echo "$SELECTED_MIC" | grep -oP '\d+(?=,)')
-SPEAKER_CARD=$(echo "$SELECTED_MIC" | grep -oP '\d+' | head -1)
+MIC_CARD=$(echo "$SELECTED_MIC" | grep -oP '\d+' | head -1)
+SELECTED_SPEAKER="hw:${MIC_CARD},0"
 
-echo "Looking for speakers on card $SPEAKER_CARD (same as mic)..."
-
-SELECTED_SPEAKER="hw:${SPEAKER_CARD},0"
-
-# Test if this speaker works
-TEST_TONE_FILE="/tmp/glados-test-tone.wav"
-echo "Generating and playing test tone on $SELECTED_SPEAKER..."
-sox -n -r 22050 "$TEST_TONE_FILE" synth 3 sine 1000 2>/dev/null || true
-if [ -f "$TEST_TONE_FILE" ]; then
-    aplay -D "$SELECTED_SPEAKER" "$TEST_TONE_FILE" 2>/dev/null
-    rm -f "$TEST_TONE_FILE"
-    if ask_yes_no "Did you hear the test tone?"; then
-        echo "Confirmed: speaker is $SELECTED_SPEAKER"
-    else
-        echo "Test tone not heard. Scanning all speakers..."
-        SELECTED_SPEAKER=""
-    fi
-fi
-
-if [ -z "${SELECTED_SPEAKER:-}" ]; then
-    echo "Scanning all available speakers..."
+# Check if this card has speakers
+if aplay -l 2>/dev/null | grep -q "card $MIC_CARD"; then
+    echo "Testing speaker on same card as mic: $SELECTED_SPEAKER..."
+    echo "(You should hear a test tone through the headset speaker)"
+    sleep 1
+    sox -n -r 22050 /tmp/glados-test-tone.wav synth 3 sine 1000 2>/dev/null
+    aplay -D "$SELECTED_SPEAKER" /tmp/glados-test-tone.wav 2>/dev/null
+    rm -f /tmp/glados-test-tone.wav
+    echo "Test tone played."
+else
+    echo "No speakers on card $MIC_CARD. Scanning all speakers..."
     SPEAKER_DEVICES=()
     while IFS= read -r line; do
         card=$(echo "$line" | grep -oP 'card \K[0-9]+')
         device=$(echo "$line" | grep -oP 'device \K[0-9]+' | head -1)
-        if [ -n "$card" ] && [ -n "$device" ]; then
-            SPEAKER_DEVICES+=("hw:${card},${device}")
-        fi
+        [ -n "$card" ] && [ -n "$device" ] && SPEAKER_DEVICES+=("hw:${card},${device}")
     done < <(aplay -l 2>/dev/null | grep 'device 0:')
 
-    for i in "${!SPEAKER_DEVICES[@]}"; do
-        dev="${SPEAKER_DEVICES[$i]}"
-        echo -n "  [${i+1}] Playing test tone on $dev (3 seconds)... "
-        sox -n -r 22050 "$TEST_TONE_FILE" synth 3 sine 1000 2>/dev/null || true
-        if [ -f "$TEST_TONE_FILE" ]; then
-            aplay -D "$dev" "$TEST_TONE_FILE" 2>/dev/null
-            rm -f "$TEST_TONE_FILE"
-        fi
-        if ask_yes_no "Did you hear the tone?"; then
-            SELECTED_SPEAKER="$dev"
-            echo "Confirmed: speaker is $SELECTED_SPEAKER"
-            break
-        fi
-    done
-fi
-
-if [ -z "${SELECTED_SPEAKER:-}" ]; then
-    echo "No speaker confirmed. Defaulting to: $SELECTED_SPEAKER"
+    if [ ${#SPEAKER_DEVICES[@]} -gt 0 ]; then
+        SELECTED_SPEAKER="${SPEAKER_DEVICES[0]}"
+        echo "Testing: $SELECTED_SPEAKER"
+        sox -n -r 22050 /tmp/glados-test-tone.wav synth 3 sine 1000 2>/dev/null
+        aplay -D "$SELECTED_SPEAKER" /tmp/glados-test-tone.wav 2>/dev/null
+        rm -f /tmp/glados-test-tone.wav
+    fi
 fi
 
 echo "Selected speaker: $SELECTED_SPEAKER"
 echo ""
 
 # =============================================================================
-# Step 3: Update spoke_config.yaml
+# Step 3: Test speaker through mic (loopback test)
 # =============================================================================
-echo "--- Step 3: Updating Configuration ---"
+echo "--- Step 3: Loopback Test (Speaker → Mic) ---"
 echo ""
 
+echo "Playing test tone through speaker and recording with mic..."
+# Generate a tone and record at the same time
+sox -n -r 22050 /tmp/glados-test-tone.wav synth 3 sine 1000 2>/dev/null
+
+# Play tone and record simultaneously
+aplay -D "$SELECTED_SPEAKER" /tmp/glados-test-tone.wav 2>/dev/null &
+SPK_PID=$!
+arecord -D "$SELECTED_MIC" -f S16_LE -r 16000 -c 1 -d 5 /tmp/glados-loopback.wav 2>/dev/null &
+REC_PID=$!
+wait $SPK_PID 2>/dev/null || true
+wait $REC_PID 2>/dev/null || true
+rm -f /tmp/glados-test-tone.wav
+
+if [ -s /tmp/glados-loopback.wav ]; then
+    echo "Recording saved. Playing it back..."
+    aplay /tmp/glados-loopback.wav 2>/dev/null
+    echo "(If you hear the test tone, the audio path is working)"
+else
+    echo "Loopback recording failed!"
+fi
+rm -f /tmp/glados-loopback.wav
+echo ""
+
+# =============================================================================
+# Step 4: Final confirmation and config generation
+# =============================================================================
+echo "--- Step 4: Final Confirmation ---"
+echo ""
+echo "Summary:"
+echo "  Microphone: $SELECTED_MIC"
+echo "  Speaker:    $SELECTED_SPEAKER"
+echo ""
+
+# Use a simple read with a default
+read -r -p "Are these correct? [Y/n] " CONFIRM
+CONFIRM=${CONFIRM:-Y}
+if [[ ! "$CONFIRM" =~ ^[Nn]$ ]]; then
+    echo "Confirmed. Generating config..."
+else
+    echo "Please edit spoke_config.yaml manually."
+    exit 0
+fi
+
+# =============================================================================
+# Step 5: Write spoke_config.yaml
+# =============================================================================
 SPEAKER_CARD_NUM=$(echo "$SELECTED_SPEAKER" | grep -oP '\d+' | head -1)
 
 cat > "$CONFIG_FILE" << YAMLEOF
@@ -212,5 +184,4 @@ echo "=== Audio Setup Complete ==="
 echo "  Speaker output: $SELECTED_SPEAKER"
 echo "  Microphone:     $SELECTED_MIC"
 echo ""
-echo "Test it with:"
-echo "  source $SCRIPT_DIR/.venv/bin/activate && glados-spoke --config $CONFIG_FILE"
+echo "Run: source $SCRIPT_DIR/.venv/bin/activate && glados-spoke --config $CONFIG_FILE"
