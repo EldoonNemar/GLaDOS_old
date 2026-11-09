@@ -1,79 +1,60 @@
 #!/usr/bin/env bash
-# GLaDOS Spoke Audio Device Auto-Configuration
-# Tests speakers and microphone, then configures PipeWire WebRTC AEC.
+# GLaDOS Spoke Audio Device Configuration (ALSA)
+# Tests speakers and microphone, then updates spoke_config.yaml.
 set -e
 
-echo "=== GLaDOS Audio Device Auto-Configuration ==="
-echo "This section will test your microphone and speaker(s) to set up"
-echo "PipeWire echo cancellation. You'll hear test sounds and record"
-echo "a few seconds of your voice."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/spoke_config.yaml"
+
+echo "=== GLaDOS Spoke Audio Device Setup ==="
 echo ""
 
 # =============================================================================
-# Install audio testing tools
+# Helper: ask yes/no
 # =============================================================================
-echo "Installing audio testing utilities..."
-apt-get install -y --no-install-recommends pipewire-bin alsa-utils 2>/dev/null || true
+ask_yes_no() {
+    local question="$1"
+    local answer="n"
+    while [[ ! "$answer" =~ ^[YyNn]$ ]]; do
+        read -rp "$question [Y/n] " -i "Y" answer
+        answer=${answer:-Y}
+    done
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
 
 # =============================================================================
-# Check if PipeWire is running
+# Step 1: Enumerate and test speaker outputs
 # =============================================================================
-echo ""
-echo "Checking PipeWire..."
-if ! systemctl --user is-active pipewire-pulse &>/dev/null; then
-    echo "PipeWire is not running. Starting it now..."
-    systemctl --user daemon-reload
-    systemctl --user enable --now pipewire pipewire-pulse wireplumber 2>/dev/null || {
-        echo "Warning: Could not start PipeWire user services."
-        echo "Please start them manually: systemctl --user enable --now pipewire pipewire-pulse wireplumber"
-        echo ""
-        exit 1
-    }
-    sleep 2
-fi
-
-if ! systemctl --user is-active pipewire-pulse &>/dev/null; then
-    echo "PipeWire still not running after startup attempt."
-    echo "Please run: systemctl --user start pipewire-pulse"
-    echo ""
-    exit 1
-fi
-
-echo "PipeWire is running."
-
-# =============================================================================
-# Enumerate and test speaker outputs
-# =============================================================================
-echo ""
 echo "--- Step 1: Speaker Output Selection ---"
-echo "The following speaker outputs were found:"
 echo ""
 
-SPEAKER_OUTPUTS=()
-while IFS=$'\t' read -r dev_name dev_desc; do
-    SPEAKER_OUTPUTS+=("$dev_name")
-done < <(pw-cli list-objects 2>/dev/null | awk '
-    /node\.name/ { name = $3 }
-    /media\.name/ { desc = $3 }
-    /Audio\/Sink/ { print name "\t" desc }
-')
+SPEAKER_DEVICES=()
+while IFS= read -r line; do
+    card=$(echo "$line" | grep -oP 'card \K[0-9]+')
+    device=$(echo "$line" | grep -oP 'device \K[0-9]+' | head -1)
+    name=$(echo "$line" | grep -oP '\] \K.*' | sed 's/,$//')
+    if [ -n "$card" ] && [ -n "$device" ]; then
+        SPEAKER_DEVICES+=("hw:${card},${device}")
+    fi
+done < <(aplay -l 2>/dev/null | grep 'device 0:')
 
-if [ ${#SPEAKER_OUTPUTS[@]} -eq 0 ]; then
-    echo "No speaker outputs found. Try: pactl list short sinks"
-    SELECTED_SPEAKER="null"
+if [ ${#SPEAKER_DEVICES[@]} -eq 0 ]; then
+    echo "No speaker outputs found."
+    echo "Run 'aplay -l' to see available devices."
+    SELECTED_SPEAKER="4"
 else
-    for i in "${!SPEAKER_OUTPUTS[@]}"; do
-        echo "  [$((i+1))] ${SPEAKER_OUTPUTS[$i]}"
+    for i in "${!SPEAKER_DEVICES[@]}"; do
+        echo "  [$((i+1))] ${SPEAKER_DEVICES[$i]}"
     done
     echo ""
     echo "Playing a test tone through each speaker (3 seconds each)..."
-    echo "Press Ctrl+C to skip this loop."
+    echo "Press Ctrl+C to skip this test."
     echo ""
 
-    for i in "${!SPEAKER_OUTPUTS[@]}"; do
-        dev="${SPEAKER_OUTPUTS[$i]}"
+    for i in "${!SPEAKER_DEVICES[@]}"; do
+        dev="${SPEAKER_DEVICES[$i]}"
         echo -n "  [$((i+1))] $dev ... "
-        speaker-test -t sine -f 1000 -l 1 -c 2 -s 0 -D "$dev" 2>/dev/null &
+        speaker-test -t sine -f 1000 -l 1 -c 2 -D "$dev" 2>/dev/null &
         SPK_PID=$!
         sleep 3
         kill $SPK_PID 2>/dev/null || true
@@ -82,48 +63,55 @@ else
     done
     echo ""
 
-    echo "Which speaker output works? (enter the number, default: 1)"
-    read -rp "> " -i "1" selected_num
-    selected_num=${selected_num:-1}
-    if [ "$selected_num" -ge 1 ] && [ "$selected_num" -le "${#SPEAKER_OUTPUTS[@]}" ]; then
-        SELECTED_SPEAKER="${SPEAKER_OUTPUTS[$((selected_num-1))]}"
-        echo "Selected speaker: $SELECTED_SPEAKER"
+    if ask_yes_no "Did you hear audio?"; then
+        echo "Which speaker works? (enter the number, default: 1)"
+        read -rp "> " -i "1" selected_num
+        selected_num=${selected_num:-1}
+        if [ "$selected_num" -ge 1 ] && [ "$selected_num" -le "${#SPEAKER_DEVICES[@]}" ]; then
+            SELECTED_SPEAKER="${SPEAKER_DEVICES[$((selected_num-1))]}"
+        else
+            SELECTED_SPEAKER="${SPEAKER_DEVICES[0]}"
+        fi
     else
-        echo "Invalid selection. Using first device: ${SPEAKER_OUTPUTS[0]}"
-        SELECTED_SPEAKER="${SPEAKER_OUTPUTS[0]}"
+        echo "No speaker detected. Defaulting to first device: ${SPEAKER_DEVICES[0]}"
+        SELECTED_SPEAKER="${SPEAKER_DEVICES[0]}"
     fi
 fi
 
-# =============================================================================
-# Enumerate and test microphone inputs
-# =============================================================================
+echo "Selected speaker: $SELECTED_SPEAKER"
 echo ""
+
+# =============================================================================
+# Step 2: Enumerate and test microphone inputs
+# =============================================================================
 echo "--- Step 2: Microphone Selection ---"
-echo "The following microphone inputs were found:"
 echo ""
 
-MIC_INPUTS=()
-while IFS=$'\t' read -r dev_name dev_desc; do
-    MIC_INPUTS+=("$dev_name")
-    echo "  [${#MIC_INPUTS[@]}] $dev_name ($dev_desc)"
-done < <(pw-cli list-objects 2>/dev/null | awk '
-    /node\.name/ { name = $3 }
-    /media\.name/ { desc = $3 }
-    /Audio\/Source/ { print name "\t" desc }
-')
+MIC_DEVICES=()
+while IFS= read -r line; do
+    card=$(echo "$line" | grep -oP 'card \K[0-9]+')
+    device=$(echo "$line" | grep -oP 'device \K[0-9]+' | head -1)
+    name=$(echo "$line" | grep -oP '\] \K.*' | sed 's/,$//')
+    if [ -n "$card" ] && [ -n "$device" ]; then
+        MIC_DEVICES+=("hw:${card},${device}")
+    fi
+done < <(arecord -l 2>/dev/null | grep 'device 0:')
 
-if [ ${#MIC_INPUTS[@]} -eq 0 ]; then
-    echo "No microphone inputs found. Try: pactl list short sources"
-    SELECTED_MIC="null"
+if [ ${#MIC_DEVICES[@]} -eq 0 ]; then
+    echo "No microphone inputs found."
+    echo "Run 'arecord -l' to see available devices."
+    SELECTED_MIC="hw:4,0"
 else
+    for i in "${!MIC_DEVICES[@]}"; do
+        echo "  [$((i+1))] ${MIC_DEVICES[$i]}"
+    done
     echo ""
-    echo "Microphone test: you will record 3 seconds of audio for each mic."
-    echo "After each recording, you will hear it back to verify it works."
+    echo "Recording from each mic (3 seconds), then playing it back..."
     echo "Press Ctrl+C to skip."
     echo ""
 
-    for i in "${!MIC_INPUTS[@]}"; do
-        mic="${MIC_INPUTS[$i]}"
+    for i in "${!MIC_DEVICES[@]}"; do
+        mic="${MIC_DEVICES[$i]}"
         echo -n "  [${i+1}] Recording from: $mic (3 seconds)... "
         arecord -D "$mic" -f S16_LE -r 16000 -c 1 -d 3 /tmp/glados-mic-test.wav 2>/dev/null &
         REC_PID=$!
@@ -134,6 +122,12 @@ else
         if [ -f /tmp/glados-mic-test.wav ]; then
             echo "done. (listening back...)"
             aplay /tmp/glados-mic-test.wav 2>/dev/null
+            if ask_yes_no "Did you hear your voice?"; then
+                SELECTED_MIC="$mic"
+                echo "Selected mic: $SELECTED_MIC"
+                rm -f /tmp/glados-mic-test.wav
+                break
+            fi
         else
             echo "failed to record."
         fi
@@ -141,75 +135,62 @@ else
     done
     rm -f /tmp/glados-mic-test.wav
 
-    echo ""
-    echo "Which microphone works? (enter the number, default: 1)"
-    read -rp "> " -i "1" selected_num
-    selected_num=${selected_num:-1}
-    if [ "$selected_num" -ge 1 ] && [ "$selected_num" -le "${#MIC_INPUTS[@]}" ]; then
-        SELECTED_MIC="${MIC_INPUTS[$((selected_num-1))]}"
-        echo "Selected mic: $SELECTED_MIC"
-    else
-        echo "Invalid selection. Using first device: ${MIC_INPUTS[0]}"
-        SELECTED_MIC="${MIC_INPUTS[0]}"
+    if [ -z "${SELECTED_MIC:-}" ]; then
+        SELECTED_MIC="${MIC_DEVICES[0]}"
+        echo "No mic confirmed. Defaulting to: $SELECTED_MIC"
     fi
 fi
+echo ""
 
 # =============================================================================
-# Configure PipeWire WebRTC AEC
+# Step 3: Update spoke_config.yaml
 # =============================================================================
+echo "--- Step 3: Updating Configuration ---"
 echo ""
-echo "--- Step 3: Configuring PipeWire Echo Cancellation ---"
-echo ""
-echo "Writing PipeWire AEC config to /etc/pipewire/pipewire.conf.d/99-aec.conf..."
-sudo mkdir -p /etc/pipewire/pipewire.conf.d
-sudo tee /etc/pipewire/pipewire.conf.d/99-aec.conf > /dev/null << PWEOF
-# GLaDOS Spoke - PipeWire WebRTC Echo Cancellation
+
+cat > "$CONFIG_FILE" << YAMLEOF
+# GLaDOS Spoke Client Configuration
 # Auto-generated on $(date -Iseconds)
-# Speaker output: $SELECTED_SPEAKER
-# Microphone input: $SELECTED_MIC
 
-context.objects = [
-    {
-        factory = "adapter"
-        args = {
-            node.name          = "Echo Cancel Source"
-            media.class        = Audio/Source
-            audio.position     [ MONO ]
-            filter.hear-me     = true
-            filter.listen-on   = "$SELECTED_SPEAKER"
-            filter.hear-me.aec.method = "webrtc"
-            filter.hear-me.aec.args.sample-rate = 16000
-            filter.hear-me.aec.args.frame-size = 512
-            filter.hear-me.aec.args.echo-tail = 512
-        }
-    }
-]
-PWEOF
+spoke:
+  # --- Hub connection ---
+  hub_host: "192.168.1.58"
+  hub_port: 5051
 
-echo "Restarting PipeWire to apply AEC config..."
-systemctl --user restart pipewire pipewire-pulse wireplumber
-sleep 2
+  # --- Audio capture (mic to hub) ---
+  mic_sample_rate: 16000
+  mic_channels: 1
+  mic_chunk_frames: 512
+  mic_device: "$SELECTED_MIC"
+  mic_volume: 1.0
 
-# Verify AEC source is active
-if pactl list sources short 2>/dev/null | grep -q "Echo Cancel Source"; then
-    echo ""
-    echo "SUCCESS! Echo cancellation is active."
-    pactl list sources short | grep -i "echo cancel"
-else
-    echo ""
-    echo "Warning: Echo cancellation source not detected after restart."
-    echo "Check PipeWire logs: journalctl --user -u pipewire -n 50"
-    echo "You can manually edit the config at:"
-    echo "  /etc/pipewire/pipewire.conf.d/99-aec.conf"
-fi
+  # --- Audio playback (hub to spoke) ---
+  spk_sample_rate: 22050
+  spk_device: $(echo "$SELECTED_SPEAKER" | grep -oP 'hw:\K[0-9]+')
 
+  # --- Echo detection ---
+  echo_text_similarity_threshold: 0.7
+  echo_text_min_length: 4
+  echo_text_recent_turns: 3
+  echo_waveform_threshold: 0.6
+  echo_aec_enabled: true
+  echo_aec_order: 256
+  echo_mute_on_detection_ms: 0
+
+  # --- Native audio mode ---
+  native_audio: true
+  native_audio_max_duration_s: 30.0
+
+  # --- Logging ---
+  log_level: "INFO"
+  heartbeat_interval_s: 5.0
+YAMLEOF
+
+echo "Configuration written to: $CONFIG_FILE"
 echo ""
 echo "=== Audio Setup Complete ==="
 echo "  Speaker output: $SELECTED_SPEAKER"
 echo "  Microphone:     $SELECTED_MIC"
-echo "  AEC method:     WebRTC (system-level)"
 echo ""
-echo "Start the spoke with:"
-echo "  source /opt/GLaDOS/spoke/.venv/bin/activate"
-echo "  glados-spoke --config /opt/GLaDOS/configs/spoke_config.yaml"
-echo ""
+echo "Test it with:"
+echo "  source $SCRIPT_DIR/.venv/bin/activate && glados-spoke --config $CONFIG_FILE"
