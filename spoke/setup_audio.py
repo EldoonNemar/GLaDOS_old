@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Universal GLaDOS Spoke audio device auto-detection."""
+"""Universal GLaDOS Spoke audio device auto-detection.
+
+Phase 1: Find the mic that picks up sound
+Phase 2: Find speaker on a DIFFERENT card (exclude mic card & HDMI)
+Phase 3: Verify the pair
+
+For USB/Conference mics, the speakers are typically on:
+- The system's audio jack (rockchip, es8388, etc.)
+- NOT on the USB device itself (that's just the mic)
+- NOT on HDMI (unless explicitly using HDMI speakers)
+"""
 
 from __future__ import annotations
 
@@ -72,6 +82,28 @@ def is_usb_device(card_name: str) -> bool:
             "blue" in lower or "steelseries" in lower)
 
 
+def is_hmi_device(card_name: str) -> bool:
+    """Check if device is HDMI-based."""
+    lower = card_name.lower()
+    return "hdmi" in lower or "hdmii" in lower
+
+
+def is_audio_jack(card_name: str) -> bool:
+    """Check if device is an audio jack (3.5mm, analog, etc.)."""
+    lower = card_name.lower()
+    return any(x in lower for x in [
+        "analog", "es8388", "es8328", "alc", "realtek",
+        "audio", "line", "headphone", "speaker", "jack",
+        "rockchip",
+    ])
+
+
+def is_input_only(card_name: str) -> bool:
+    """Check if device is input-only (like HDMI-IN)."""
+    lower = card_name.lower()
+    return "in" in lower or "capture" in lower
+
+
 def test_capture_device(hw: str, duration: int = 3) -> tuple[bool, float, str]:
     tmp = f"/tmp/glados-capture-{hw.replace(',', '-')}.wav"
     try:
@@ -79,7 +111,6 @@ def test_capture_device(hw: str, duration: int = 3) -> tuple[bool, float, str]:
             os.unlink(tmp)
         except OSError:
             pass
-
         p = subprocess.Popen(
             ["arecord", "-D", hw, "-f", "S16_LE", "-r", "16000",
              "-c", "1", "-d", str(duration), tmp],
@@ -94,10 +125,8 @@ def test_capture_device(hw: str, duration: int = 3) -> tuple[bool, float, str]:
 
         if not os.path.exists(tmp):
             return False, 0, "no file"
-
-        file_size = os.path.getsize(tmp)
-        if file_size <= 100:
-            return False, 0, f"small({file_size}b)"
+        if os.path.getsize(tmp) <= 100:
+            return False, 0, f"small({os.path.getsize(tmp)}b)"
 
         with open(tmp, "rb") as f:
             f.read(44)
@@ -139,18 +168,14 @@ def find_working_mic(card_count: int) -> dict | None:
                 is_usb = is_usb_device(card_name)
                 if is_usb:
                     usb_mics.append({
-                        "hw": hw,
-                        "name": f"{card_name} (hw:{card},{dev})",
-                        "peak": peak,
-                        "is_usb": True,
+                        "hw": hw, "name": card_name, "peak": peak,
+                        "card": card, "is_usb": True,
                     })
                     print(f"  + {hw} ({card_name}) [USB] peak={peak:.0f}")
                 else:
                     other_mics.append({
-                        "hw": hw,
-                        "name": f"{card_name} (hw:{card},{dev})",
-                        "peak": peak,
-                        "is_usb": False,
+                        "hw": hw, "name": card_name, "peak": peak,
+                        "card": card, "is_usb": False,
                     })
                     print(f"  . {hw} ({card_name}) peak={peak:.0f}")
             else:
@@ -158,120 +183,134 @@ def find_working_mic(card_count: int) -> dict | None:
 
     if usb_mics:
         best = max(usb_mics, key=lambda m: m["peak"])
-        print(f"\n  Selected USB mic: {best['hw']} (peak: {best['peak']:.0f})")
+        print(f"\n  Selected USB mic: {best['hw']} (card {best['card']})")
         return best
     if other_mics:
         best = max(other_mics, key=lambda m: m["peak"])
-        print(f"\n  Selected: {best['hw']} (peak: {best['peak']:.0f})")
+        print(f"\n  Selected: {best['hw']} (card {best['card']})")
         return best
-
     print("\n  No working mic found.")
     return None
 
 
-def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
-    """Play white noise through each device, record with mic.
+def find_working_speaker(mic_card: int, card_count: int) -> dict | None:
+    """Find speaker on a DIFFERENT card than the mic.
 
-    White noise contains ALL frequencies (20Hz-20kHz), making it
-    detectable by any speaker-mic combination regardless of frequency
-    response. Conference mics with DSP/AGC will pick up white noise.
+    USB/Conference mics have their own internal speakers (usually not
+    used). The external speakers are typically on:
+    - The system's audio jack (rockchip, es8388, etc.)
+    - NOT on the same card as the mic
+    - NOT on HDMI (unless explicitly using HDMI speakers)
+
+    Scoring:
+    - +100: Not the mic card
+    +100: Not HDMI
+    +100: Audio jack (3.5mm, analog)
+    +50: Has playback capability
     """
     print("\n=== Phase 2: Finding Speaker ===")
-    print("Playing white noise through each device, recording with mic...\n")
+    print("Looking for speakers on different card than mic (card " + str(mic_card) + ")\n")
 
-    detected = []  # All devices the mic heard
+    candidates = []
 
     for card in range(card_count):
         card_name = get_card_name(card)
         for dev in range(MAX_DEVICES_PER_CARD):
             hw = f"hw:{card},{dev}"
 
-            output = f"/tmp/glados-spk-{hw.replace(',', '-')}.wav"
+            # Test playback capability
             try:
-                try:
-                    os.unlink(output)
-                except OSError:
-                    pass
-
-                # Play white noise using speaker-test with noise type
                 spk = subprocess.Popen(
-                    ["speaker-test", "-t", "white", "-l", "1",
+                    ["speaker-test", "-t", "silence", "-l", "0",
                      "-c", "2", "-D", hw],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     start_new_session=True)
-
-                # Record with the mic
-                rec = subprocess.Popen(
-                    ["arecord", "-D", mic_hw, "-f", "S16_LE", "-r", "16000",
-                     "-c", "1", "-d", "5", output],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                stdout, stderr = rec.communicate(timeout=10)
-
-                # Stop speaker-test
+                stdout, stderr = spk.communicate(timeout=3)
+                playback_ok = spk.returncode == 0
                 spk.terminate()
                 try:
-                    spk.wait(timeout=3)
+                    spk.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     spk.kill()
                 kill_speaker_test(hw)
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                playback_ok = False
 
-                # Check recording
-                if os.path.exists(output) and os.path.getsize(output) > 200:
-                    with open(output, "rb") as f:
-                        f.read(44)
-                        raw = f.read()
-                    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-                    peak = float(np.max(np.abs(samples)))
+            if not playback_ok:
+                continue
 
-                    if peak > 100:  # Must be clearly audible
-                        detected.append({
-                            "hw": hw,
-                            "name": f"{card_name} (hw:{card},{dev})",
-                            "peak": peak,
-                        })
-                        print(f"  + {hw} ({card_name}) heard (peak: {peak:.0f})")
-                    else:
-                        print(f"  - {hw} ({card_name}): quiet (peak: {peak:.0f})")
-                else:
-                    print(f"  - {hw} ({card_name}): no recording")
+            # Score this device
+            score = 0
+            reasons = []
 
-            except Exception as e:
-                print(f"  - {hw}: error: {e}")
-            finally:
-                try:
-                    os.unlink(output)
-                except OSError:
-                    pass
+            # Must NOT be the mic card
+            if card == mic_card:
+                continue  # Skip entirely - can't be speaker on same card as mic
 
-    if detected:
-        # Pick the one with highest peak
-        best = max(detected, key=lambda d: d["peak"])
-        print(f"\n  Selected speaker: {best['hw']} (peak: {best['peak']:.0f})")
-        print(f"  Also detected: {[d['hw'] for d in detected if d['hw'] != best['hw']]}")
+            # Prefer non-HDMI
+            if is_hmi_device(card_name):
+                score += 0
+                reasons.append("HDMI")
+            else:
+                score += 100
+                reasons.append("not-HDMI")
+
+            # Prefer audio jacks
+            if is_audio_jack(card_name):
+                score += 100
+                reasons.append("audio-jack")
+
+            # Penalize input-only devices
+            if is_input_only(card_name):
+                score -= 50
+                reasons.append("input-only")
+
+            candidates.append({
+                "hw": hw, "name": card_name, "card": card,
+                "score": score, "reasons": reasons,
+            })
+
+    # Sort by score
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+
+    if candidates:
+        best = candidates[0]
+        print(f"  Top candidate: {best['hw']} ({best['name']})")
+        print(f"    Score: {best['score']}, Reasons: {', '.join(best['reasons'])}")
+
+        # Show top 3
+        print("\n  All candidates:")
+        for c in candidates[:3]:
+            print(f"    {c['hw']} ({c['name']}): score={c['score']} ({', '.join(c['reasons'])})")
+
         return best
 
-    print("\n  No speaker detected. The mic didn't hear any speaker.")
+    print("\n  No speaker candidates found.")
     return None
 
 
 def loopback_verify(speaker_hw: str, mic_hw: str) -> tuple[bool, float]:
-    """Verify with white noise."""
+    """Verify with a distinctive sound pattern."""
     output = "/tmp/glados-verify.wav"
     try:
         try:
             os.unlink(output)
         except OSError:
             pass
+        # Play distinctive 3-tone pattern
         spk = subprocess.Popen(
-            ["speaker-test", "-t", "white", "-l", "1",
+            ["speaker-test", "-t", "sine", "-l", "1",
              "-c", "2", "-D", speaker_hw],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True)
+
+        # Record with the mic
         rec = subprocess.Popen(
             ["arecord", "-D", mic_hw, "-f", "S16_LE", "-r", "16000",
-             "-c", "1", "-d", "5", output],
+             "-c", "1", "-d", "4", output],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = rec.communicate(timeout=10)
+        stdout, stderr = rec.communicate(timeout=8)
+
         spk.terminate()
         try:
             spk.wait(timeout=3)
@@ -388,20 +427,25 @@ def main() -> None:
     print(f"\n=== GLaDOS Spoke Audio Setup ===")
     print(f"Detected {card_count} ALSA cards\n")
 
+    # Phase 1: Find mic
     mic_info = find_working_mic(card_count)
     if not mic_info:
         print("\nERROR: No working microphone found.")
         sys.exit(1)
 
     mic_hw = mic_info["hw"]
+    mic_card = mic_info["card"]
 
-    spk_info = find_working_speaker(mic_hw, card_count)
+    # Phase 2: Find speaker (different card, not HDMI, prefer audio jacks)
+    spk_info = find_working_speaker(mic_card, card_count)
     if not spk_info:
-        print("\nERROR: No speaker detected by the microphone.")
+        print("\nERROR: No speaker candidates found.")
+        print("Try: glados-spoke setup --manual")
         sys.exit(1)
 
     spk_hw = spk_info["hw"]
 
+    # Phase 3: Verify
     print("\n=== Phase 3: Verifying Pair ===")
     ok, peak = loopback_verify(spk_hw, mic_hw)
     if ok:
@@ -410,6 +454,7 @@ def main() -> None:
         print("  ✗ Verification failed.")
         sys.exit(1)
 
+    # Test rates
     print("\n=== Testing Sample Rates ===")
     spk_rates = test_rates(spk_hw, False)
     mic_rates = test_rates(mic_hw, True)
