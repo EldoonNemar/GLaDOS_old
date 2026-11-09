@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 # GLaDOS Spoke Audio Device Configuration (ALSA)
-# Tests speakers and microphone, then updates spoke_config.yaml.
+# Tests mic first to identify the USB headset, then tests speaker on that card.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/spoke_config.yaml"
-
-echo "=== GLaDOS Spoke Audio Device Setup ==="
-echo ""
 
 # =============================================================================
 # Helper: ask yes/no
@@ -22,124 +19,145 @@ ask_yes_no() {
     [[ "$answer" =~ ^[Yy]$ ]]
 }
 
-# =============================================================================
-# Step 1: Enumerate and test speaker outputs
-# =============================================================================
-echo "--- Step 1: Speaker Output Selection ---"
+echo "=== GLaDOS Spoke Audio Device Setup ==="
 echo ""
 
-SPEAKER_DEVICES=()
-while IFS= read -r line; do
-    card=$(echo "$line" | grep -oP 'card \K[0-9]+')
-    device=$(echo "$line" | grep -oP 'device \K[0-9]+' | head -1)
-    name=$(echo "$line" | grep -oP '\] \K.*' | sed 's/,$//')
-    if [ -n "$card" ] && [ -n "$device" ]; then
-        SPEAKER_DEVICES+=("hw:${card},${device}")
-    fi
-done < <(aplay -l 2>/dev/null | grep 'device 0:')
+# =============================================================================
+# Step 1: Find the USB headset mic (hw:4,0 typically)
+# =============================================================================
+echo "--- Step 1: Identify Microphone ---"
+echo ""
 
-if [ ${#SPEAKER_DEVICES[@]} -eq 0 ]; then
-    echo "No speaker outputs found."
-    echo "Run 'aplay -l' to see available devices."
-    SELECTED_SPEAKER="4"
-else
-    for i in "${!SPEAKER_DEVICES[@]}"; do
-        echo "  [$((i+1))] ${SPEAKER_DEVICES[$i]}"
-    done
+# Check if hw:4 (USB headset) exists — it's the most common on Raspberry Pi
+USB_MIC_FOUND=false
+for i in "4" "3" "0"; do
+    if arecord -l 2>/dev/null | grep -q "card $i"; then
+        USB_MIC_FOUND=true
+        break
+    fi
+done
+
+if [ "$USB_MIC_FOUND" = true ]; then
+    SELECTED_MIC="hw:4,0"
+    echo "Detected USB headset mic (hw:4,0). Testing..."
+    echo "Speak into the mic for 3 seconds..."
+    sleep 1
+    arecord -D "hw:4,0" -f S16_LE -r 16000 -c 1 -d 3 /tmp/glados-mic-test.wav 2>/dev/null
+    echo "Playing back your recording..."
+    aplay /tmp/glados-mic-test.wav 2>/dev/null
+    rm -f /tmp/glados-mic-test.wav
+    if ask_yes_no "Did you hear yourself clearly?"; then
+        echo "Confirmed: microphone is $SELECTED_MIC"
+    else
+        echo "USB headset mic didn't work. Scanning for other mics..."
+        SELECTED_MIC=""
+    fi
+fi
+
+if [ -z "${SELECTED_MIC:-}" ]; then
     echo ""
-    echo "Playing a test tone through each speaker (3 seconds each)..."
-    echo "Press Ctrl+C to skip this test."
-    echo ""
+    echo "No USB headset detected. Scanning all available mics..."
+    MIC_DEVICES=()
+    while IFS= read -r line; do
+        card=$(echo "$line" | grep -oP 'card \K[0-9]+')
+        device=$(echo "$line" | grep -oP 'device \K[0-9]+' | head -1)
+        if [ -n "$card" ] && [ -n "$device" ]; then
+            MIC_DEVICES+=("hw:${card},${device}")
+        fi
+    done < <(arecord -l 2>/dev/null | grep 'device 0:')
+
+    if [ ${#MIC_DEVICES[@]} -eq 0 ]; then
+        echo "No microphones found at all!"
+        SELECTED_MIC="hw:0,0"
+    else
+        for i in "${!MIC_DEVICES[@]}"; do
+            mic="${MIC_DEVICES[$i]}"
+            echo -n "  [${i+1}] Recording from $mic (3 seconds)... "
+            arecord -D "$mic" -f S16_LE -r 16000 -c 1 -d 3 /tmp/glados-mic-test.wav 2>/dev/null &
+            sleep 3
+            kill $! 2>/dev/null || true
+            wait $! 2>/dev/null || true
+
+            if [ -f /tmp/glados-mic-test.wav ]; then
+                echo "listening back..."
+                aplay /tmp/glados-mic-test.wav 2>/dev/null
+                if ask_yes_no "Did you hear your voice?"; then
+                    SELECTED_MIC="$mic"
+                    echo "Confirmed: microphone is $SELECTED_MIC"
+                    break
+                fi
+            else
+                echo "failed to record."
+            fi
+            rm -f /tmp/glados-mic-test.wav
+        done
+    fi
+fi
+
+echo "Selected microphone: $SELECTED_MIC"
+echo ""
+
+# =============================================================================
+# Step 2: Find the speaker on the SAME card as the mic
+# =============================================================================
+echo "--- Step 2: Identify Speaker ---"
+echo ""
+
+# Extract the card number from the mic device
+MIC_CARD=$(echo "$SELECTED_MIC" | grep -oP '\d+(?=,)')
+SPEAKER_CARD=$(echo "$SELECTED_MIC" | grep -oP '\d+' | head -1)
+
+echo "Looking for speakers on card $SPEAKER_CARD (same as mic)..."
+
+SELECTED_SPEAKER="hw:${SPEAKER_CARD},0"
+
+# Test if this speaker works
+TEST_TONE_FILE="/tmp/glados-test-tone.wav"
+echo "Generating and playing test tone on $SELECTED_SPEAKER..."
+sox -n -r 22050 "$TEST_TONE_FILE" synth 3 sine 1000 2>/dev/null || true
+if [ -f "$TEST_TONE_FILE" ]; then
+    aplay -D "$SELECTED_SPEAKER" "$TEST_TONE_FILE" 2>/dev/null
+    rm -f "$TEST_TONE_FILE"
+    if ask_yes_no "Did you hear the test tone?"; then
+        echo "Confirmed: speaker is $SELECTED_SPEAKER"
+    else
+        echo "Test tone not heard. Scanning all speakers..."
+        SELECTED_SPEAKER=""
+    fi
+fi
+
+if [ -z "${SELECTED_SPEAKER:-}" ]; then
+    echo "Scanning all available speakers..."
+    SPEAKER_DEVICES=()
+    while IFS= read -r line; do
+        card=$(echo "$line" | grep -oP 'card \K[0-9]+')
+        device=$(echo "$line" | grep -oP 'device \K[0-9]+' | head -1)
+        if [ -n "$card" ] && [ -n "$device" ]; then
+            SPEAKER_DEVICES+=("hw:${card},${device}")
+        fi
+    done < <(aplay -l 2>/dev/null | grep 'device 0:')
 
     for i in "${!SPEAKER_DEVICES[@]}"; do
         dev="${SPEAKER_DEVICES[$i]}"
-        echo -n "  [$((i+1))] $dev ... "
-        speaker-test -t sine -f 1000 -l 1 -c 2 -D "$dev" 2>/dev/null &
-        SPK_PID=$!
-        sleep 3
-        kill $SPK_PID 2>/dev/null || true
-        wait $SPK_PID 2>/dev/null || true
-        echo "done."
-    done
-    echo ""
-
-    if ask_yes_no "Did you hear audio?"; then
-        echo "Which speaker works? (enter the number, default: 1)"
-        read -rp "> " -i "1" selected_num
-        selected_num=${selected_num:-1}
-        if [ "$selected_num" -ge 1 ] && [ "$selected_num" -le "${#SPEAKER_DEVICES[@]}" ]; then
-            SELECTED_SPEAKER="${SPEAKER_DEVICES[$((selected_num-1))]}"
-        else
-            SELECTED_SPEAKER="${SPEAKER_DEVICES[0]}"
+        echo -n "  [${i+1}] Playing test tone on $dev (3 seconds)... "
+        sox -n -r 22050 "$TEST_TONE_FILE" synth 3 sine 1000 2>/dev/null || true
+        if [ -f "$TEST_TONE_FILE" ]; then
+            aplay -D "$dev" "$TEST_TONE_FILE" 2>/dev/null
+            rm -f "$TEST_TONE_FILE"
         fi
-    else
-        echo "No speaker detected. Defaulting to first device: ${SPEAKER_DEVICES[0]}"
-        SELECTED_SPEAKER="${SPEAKER_DEVICES[0]}"
-    fi
+        if ask_yes_no "Did you hear the tone?"; then
+            SELECTED_SPEAKER="$dev"
+            echo "Confirmed: speaker is $SELECTED_SPEAKER"
+            break
+        fi
+    done
+fi
+
+if [ -z "${SELECTED_SPEAKER:-}" ]; then
+    echo "No speaker confirmed. Defaulting to: $SELECTED_SPEAKER"
 fi
 
 echo "Selected speaker: $SELECTED_SPEAKER"
-echo ""
-
-# =============================================================================
-# Step 2: Enumerate and test microphone inputs
-# =============================================================================
-echo "--- Step 2: Microphone Selection ---"
-echo ""
-
-MIC_DEVICES=()
-while IFS= read -r line; do
-    card=$(echo "$line" | grep -oP 'card \K[0-9]+')
-    device=$(echo "$line" | grep -oP 'device \K[0-9]+' | head -1)
-    name=$(echo "$line" | grep -oP '\] \K.*' | sed 's/,$//')
-    if [ -n "$card" ] && [ -n "$device" ]; then
-        MIC_DEVICES+=("hw:${card},${device}")
-    fi
-done < <(arecord -l 2>/dev/null | grep 'device 0:')
-
-if [ ${#MIC_DEVICES[@]} -eq 0 ]; then
-    echo "No microphone inputs found."
-    echo "Run 'arecord -l' to see available devices."
-    SELECTED_MIC="hw:4,0"
-else
-    for i in "${!MIC_DEVICES[@]}"; do
-        echo "  [$((i+1))] ${MIC_DEVICES[$i]}"
-    done
-    echo ""
-    echo "Recording from each mic (3 seconds), then playing it back..."
-    echo "Press Ctrl+C to skip."
-    echo ""
-
-    for i in "${!MIC_DEVICES[@]}"; do
-        mic="${MIC_DEVICES[$i]}"
-        echo -n "  [${i+1}] Recording from: $mic (3 seconds)... "
-        arecord -D "$mic" -f S16_LE -r 16000 -c 1 -d 3 /tmp/glados-mic-test.wav 2>/dev/null &
-        REC_PID=$!
-        sleep 3
-        kill $REC_PID 2>/dev/null || true
-        wait $REC_PID 2>/dev/null || true
-
-        if [ -f /tmp/glados-mic-test.wav ]; then
-            echo "done. (listening back...)"
-            aplay /tmp/glados-mic-test.wav 2>/dev/null
-            if ask_yes_no "Did you hear your voice?"; then
-                SELECTED_MIC="$mic"
-                echo "Selected mic: $SELECTED_MIC"
-                rm -f /tmp/glados-mic-test.wav
-                break
-            fi
-        else
-            echo "failed to record."
-        fi
-        sleep 1
-    done
-    rm -f /tmp/glados-mic-test.wav
-
-    if [ -z "${SELECTED_MIC:-}" ]; then
-        SELECTED_MIC="${MIC_DEVICES[0]}"
-        echo "No mic confirmed. Defaulting to: $SELECTED_MIC"
-    fi
-fi
 echo ""
 
 # =============================================================================
@@ -147,6 +165,8 @@ echo ""
 # =============================================================================
 echo "--- Step 3: Updating Configuration ---"
 echo ""
+
+SPEAKER_CARD_NUM=$(echo "$SELECTED_SPEAKER" | grep -oP '\d+' | head -1)
 
 cat > "$CONFIG_FILE" << YAMLEOF
 # GLaDOS Spoke Client Configuration
@@ -166,7 +186,7 @@ spoke:
 
   # --- Audio playback (hub to spoke) ---
   spk_sample_rate: 22050
-  spk_device: $(echo "$SELECTED_SPEAKER" | grep -oP 'hw:\K[0-9]+')
+  spk_device: $SPEAKER_CARD_NUM
 
   # --- Echo detection ---
   echo_text_similarity_threshold: 0.7
