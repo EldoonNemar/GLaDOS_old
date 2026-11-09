@@ -240,6 +240,7 @@ class SpeakerClient(ReconnectingWS):
         **kwargs: Any,
     ) -> None:
         super().__init__(url, **kwargs)
+        self.spk_device = spk_device
         self._current_sample_rate: int = 22050
         self._current_play_time: float = 0.0
         self._current_id: str | None = None
