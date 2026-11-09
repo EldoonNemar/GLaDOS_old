@@ -27,7 +27,12 @@ def _build_url(host: str, port: int, path: str) -> str:
 
 
 def _decode_mp3_to_float32(mp3_data: bytes, sample_rate: int) -> np.ndarray:
-    """Decode MP3 bytes to a float32 numpy array suitable for sounddevice."""
+    """Decode MP3 bytes to a float32 numpy array suitable for sounddevice.
+
+    Tries pygame first (fast, native), falls back to subprocess mpg123/ffplay,
+    and finally to raw int16 PCM if nothing else is available.
+    """
+    # Try pygame first (fastest)
     try:
         import pygame.mixer
         import pygame.sndarray
@@ -38,9 +43,41 @@ def _decode_mp3_to_float32(mp3_data: bytes, sample_rate: int) -> np.ndarray:
         samples = pygame.sndarray.array(sound)
         pygame.mixer.uninit()
         return (samples.astype(np.int16) / 32768.0).astype(np.float32).flatten()
-    except Exception as exc:
-        logger.warning("pygame MP3 decode failed (%s), treating as raw int16", exc)
-        return (np.frombuffer(mp3_data, dtype=np.int16) / 32768.0).astype(np.float32)
+    except Exception:
+        pass
+
+    # Try mpg123 (fast, common on Linux)
+    try:
+        import subprocess
+        proc = subprocess.Popen(
+            ["mpg123", "-s", "-r", str(sample_rate), "-f", "0", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        raw, _ = proc.communicate(mp3_data, timeout=10)
+        if raw:
+            return (np.frombuffer(raw, dtype=np.int16) / 32768.0).astype(np.float32)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        pass
+
+    # Try ffplay/ffmpeg
+    try:
+        import subprocess
+        proc = subprocess.Popen(
+            ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", str(sample_rate), "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        raw, _ = proc.communicate(mp3_data, timeout=10)
+        if raw:
+            return (np.frombuffer(raw, dtype=np.int16) / 32768.0).astype(np.float32)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        pass
+
+    # Fallback: treat as raw int16 PCM
+    return (np.frombuffer(mp3_data, dtype=np.int16) / 32768.0).astype(np.float32)
 
 
 def _decode_raw_float32(data: bytes, sample_rate: int) -> np.ndarray:
