@@ -52,8 +52,15 @@ echo "  glados-spoke --config spoke_config.yaml"
 echo ""
 
 # Run audio device setup
-read -p "Configure audio devices and PipeWire AEC? (y/N) " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    bash "$SCRIPT_DIR/audio_device_setup.sh"
-fi
+while true; do
+    read -p "Configure audio devices and PipeWire AEC? (y/N) " -n 1 -r REPLY
+    echo
+    if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+        bash "$SCRIPT_DIR/audio_device_setup.sh"
+        break
+    elif [[ "$REPLY" =~ ^[Nn]$ ]]; then
+        echo "Skipping audio device setup."
+        break
+    fi
+    echo "Please enter y or n."
+done
