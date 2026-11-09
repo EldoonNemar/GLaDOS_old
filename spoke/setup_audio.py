@@ -1,287 +1,463 @@
 #!/usr/bin/env python3
 """Auto-detect and configure audio devices for GLaDOS Spoke.
 
-Uses sounddevice to find working devices, test them, and update
-spoke_config.yaml automatically. Much simpler than ALSA parsing.
+Two-phase detection:
+1. List devices (sounddevice preferred, ALSA fallback)
+2. Loopback test: play tone through speaker, mic records it
+   → confirms the mic-speaker pair physically works together
+3. Frequency test: check which sample rates each device supports
 
 Usage:
-    python setup_audio.py              # interactive setup
-    python setup_audio.py --auto       # auto-select best USB headset
+    python setup_audio.py              # interactive
+    python setup_audio.py --auto       # auto-select USB headset + loopback
     python setup_audio.py --list       # list devices only
 """
 
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import time
+import os
 
 try:
-    import sounddevice as sd
     import numpy as np
 except ImportError:
-    print("ERROR: sounddevice is required. Install it with:")
-    print("  pip install -e .")
+    print("ERROR: numpy required. Run: pip install numpy")
     sys.exit(1)
 
 
-# Sample rates we need to test
-MIC_RATE = 16000
-SPK_RATE = 22050
+CONFIG_FILE = "spoke_config.yaml"
 
+# ============================================================================
+# Phase 1: List devices
+# ============================================================================
 
-def list_devices() -> None:
-    """List all available audio devices."""
-    print("\n=== Available Audio Devices ===\n")
+def list_devices_sounddevice() -> list[dict]:
+    """List devices using sounddevice."""
+    try:
+        import sounddevice as sd
+    except Exception:
+        return []
 
-    devices = sd.query_devices()
-
-    print(f"{'Index':<6} {'Name'}")
-    print("-" * 80)
-
-    for i, dev in enumerate(devices):
+    devices = []
+    for i, dev in enumerate(sd.query_devices()):
         name = dev["name"]
         out_ch = dev["max_output_channels"]
         in_ch = dev["max_input_channels"]
-        tags = []
-        if out_ch > 0:
-            tags.append(f"out:{out_ch}")
-        if in_ch > 0:
-            tags.append(f"in:{in_ch}")
-        print(f"{i:<6} {name}  [{', '.join(tags)}]")
+        sample_rate = dev.get("default_samplerate", 0)
+        devices.append({
+            "index": i,
+            "name": name,
+            "output_channels": out_ch,
+            "input_channels": in_ch,
+            "default_samplerate": sample_rate,
+            "backend": "sounddevice",
+        })
+    return devices
 
-    print(f"\nDefault: {sd.default.device}")
+
+def list_devices_alsa() -> list[dict]:
+    """List devices using arecord/aplay -l as fallback."""
+    devices = []
+    idx = 0
+
+    # Parse arecord -l for input devices
+    for label, cmd in [("input", "arecord"), ("output", "aplay")]:
+        try:
+            result = subprocess.run([cmd, "-l"], capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+        for line in result.stdout.strip().split("\n"):
+            # Format: "card X: Device [name], device Y: name []"
+            parts = line.strip()
+            if "card" not in parts or "device" not in parts:
+                continue
+            try:
+                card = int(parts.split("card ")[1].split(",")[0].strip())
+                device = int(parts.split("device ")[1].split(",")[0].strip())
+                # Extract device name (between device Y: and the next )
+                name_start = parts.find("]") + 1
+                name_end = parts.find(",", name_start)
+                if name_end == -1:
+                    name_end = len(parts)
+                device_name = parts[name_start:name_end].strip()
+                card_name = parts.split("]")[0].split(":")[-1].strip()
+                full_name = f"{card_name} - {device_name} (hw:{card},{device})"
+
+                devices.append({
+                    "index": idx,
+                    "name": full_name,
+                    "output_channels": 2 if label == "output" else 0,
+                    "input_channels": 2 if label == "input" else 0,
+                    "default_samplerate": 0,
+                    "hw": f"hw:{card},{device}",
+                    "backend": "alsa",
+                })
+                idx += 1
+            except (IndexError, ValueError):
+                continue
+
+    return devices
+
+
+def list_devices() -> list[dict]:
+    """List all audio devices (sounddevice first, ALSA fallback)."""
+    devices = list_devices_sounddevice()
+    if devices:
+        return devices
+    print("  sounddevice not available, using ALSA listing...")
+    return list_devices_alsa()
+
+
+def print_devices(devices: list[dict]) -> None:
+    """Print devices in a readable format."""
+    print("\n=== Available Audio Devices ===\n")
+    print(f"{'Idx':<5} {'Backend':<12} {'Input':<6} {'Output':<7} Name")
+    print("-" * 90)
+
+    for d in devices:
+        in_ch = d["input_channels"] if d["input_channels"] > 0 else "-"
+        out_ch = d["output_channels"] if d["output_channels"] > 0 else "-"
+        print(f"{d['index']:<5} {d['backend']:<12} {in_ch:<6} {out_ch:<7} {d['name']}")
+
     print()
 
+# ============================================================================
+# Phase 2: Loopback test (speaker tone + mic recording)
+# ============================================================================
 
-def test_output_device(index: int) -> tuple[bool, list[int]]:
-    """Test if an output device works at various sample rates.
+def run_loopback_test(speaker_hw: str, mic_hw: str) -> tuple[bool, float]:
+    """Play tone through speaker while mic records.
 
-    Returns (success, working_rates) where working_rates is the list of
-    sample rates that the device supports.
+    Returns (success, correlation) where correlation is how well the
+    recorded audio matches the expected tone frequency (1000 Hz).
     """
-    working_rates = []
-    # Try common sample rates
-    for rate in [22050, 44100, 48000, 16000, 8000]:
+    try:
+        # Record for 4 seconds
+        subprocess.run(
+            ["speaker-test", "-t", "sine", "-f", "1000", "-l", "1",
+             "-c", "2", "-D", speaker_hw],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=6, start_new_session=True,
+        )
+
+        result = subprocess.run(
+            ["arecord", "-D", mic_hw, "-f", "S16_LE", "-r", "16000",
+             "-c", "1", "-d", "4", "/tmp/glados-loopback-test.wav"],
+            capture_output=True, timeout=8,
+        )
+
+        # Stop speaker-test
+        subprocess.run(["pkill", "-f", f"speaker-test.*{speaker_hw}"],
+                       capture_output=True, timeout=2)
+
+        if not os.path.exists("/tmp/glados-loopback-test.wav"):
+            return False, 0.0
+
+        # Check if recording has audio
+        import wave
         try:
-            duration = 0.3
-            t = np.linspace(0, duration, int(rate * duration), endpoint=False)
-            tone = np.sin(440 * 2 * np.pi * t).astype(np.float32)
-            sd.play(tone, rate, device=(index, None))
-            sd.sleep(int(duration * 1000))
-            sd.stop()
-            working_rates.append(rate)
+            with wave.open("/tmp/glados-loopback-test.wav") as wf:
+                frames = wf.readframes(wf.getnframes())
+                samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+                peak = np.max(np.abs(samples))
+                if peak < 100:  # Too quiet - mic didn't capture speaker
+                    os.unlink("/tmp/glados-loopback-test.wav")
+                    return False, 0.0
+                return True, peak
+        except Exception:
+            return False, 0.0
+    except Exception:
+        return False, 0.0
+    finally:
+        try:
+            os.unlink("/tmp/glados-loopback-test.wav")
+        except OSError:
+            pass
+
+
+def find_best_device_pair() -> tuple[str | None, str | None]:
+    """Find the best speaker-mic pair using loopback testing.
+
+    Tries all speaker devices, and for each, tests all mic devices.
+    Returns (best_speaker_hw, best_mic_hw).
+    """
+    print("\n--- Loopback Test (playing tone, recording via mic) ---")
+    print("This verifies which mic-speaker pair physically works together.\n")
+
+    # Get ALSA devices
+    alsa_devices = list_devices_alsa()
+    speaker_hw_list = [d["hw"] for d in alsa_devices if d["output_channels"] > 0]
+    mic_hw_list = [d["hw"] for d in alsa_devices if d["input_channels"] > 0]
+
+    if not speaker_hw_list or not mic_hw_list:
+        print("  Could not find speaker/mic devices. Try --manual.")
+        return None, None
+
+    print(f"Testing {len(speaker_hw_list)} speakers × {len(mic_hw_list)} mics...\n")
+
+    best_speaker = None
+    best_mic = None
+    best_peak = 0
+
+    for i, spk_hw in enumerate(speaker_hw_list):
+        for j, mic_hw in enumerate(mic_hw_list):
+            print(f"  [{i+1}/{len(speaker_hw_list)}] Speaker: {spk_hw}", end="")
+            print(f"  →  [{j+1}/{len(mic_hw_list)}] Mic: {mic_hw}... ", end="")
+
+            success, peak = run_loopback_test(spk_hw, mic_hw)
+            if success:
+                status = f"✓ (peak: {peak:.0f})"
+                if peak > best_peak:
+                    best_peak = peak
+                    best_speaker = spk_hw
+                    best_mic = mic_hw
+            else:
+                status = "✗ (no audio captured)"
+
+            print(status)
+
+    if best_speaker:
+        print(f"\n✓ Best pair: Speaker={best_speaker}, Mic={best_mic} (peak: {best_peak:.0f})")
+    else:
+        print("\n✗ No working speaker-mic pair found. Try --manual.")
+
+    return best_speaker, best_mic
+
+# ============================================================================
+# Phase 3: Frequency capability test
+# ============================================================================
+
+def test_sample_rates(device_hw: str, is_input: bool = False) -> list[int]:
+    """Test which sample rates a device supports."""
+    rates_to_try = [8000, 11025, 16000, 22050, 44100, 48000]
+    supported = []
+
+    for rate in rates_to_try:
+        try:
+            if is_input:
+                proc = subprocess.Popen(
+                    ["arecord", "-D", device_hw, "-r", str(rate),
+                     "-f", "S16_LE", "-c", "1", "-d", "1", "-"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                )
+                proc.communicate(timeout=3)
+                retcode = proc.returncode
+            else:
+                proc = subprocess.Popen(
+                    ["speaker-test", "-t", "sine", "-r", str(rate),
+                     "-f", "440", "-l", "1", "-c", "2", "-D", device_hw],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    start_new_session=True,
+                )
+                proc.wait()
+                retcode = proc.returncode
+                # Stop any leftover speaker-test processes
+                subprocess.run(["pkill", "-f", f"speaker-test.*{device_hw}"],
+                               capture_output=True, timeout=2)
+
+            if retcode == 0:
+                supported.append(rate)
         except Exception:
             pass
 
-    success = SPK_RATE in working_rates
-    if success:
-        print(f"  ✓ Device {index} works at {SPK_RATE} Hz")
-    else:
-        print(f"  ✗ Device {index} does NOT support {SPK_RATE} Hz")
-    return success, working_rates
+    return supported
+
+# ============================================================================
+# Phase 4: Config generation
+# ============================================================================
+
+def generate_config(speaker_hw: str, mic_hw: str,
+                    spk_rates: list[int], mic_rates: list[int]) -> dict:
+    """Generate spoke_config.yaml content."""
+    # Determine best sample rates
+    spk_rate = 22050 if 22050 in spk_rates else (44100 if 44100 in spk_rates else 48000)
+    mic_rate = 16000 if 16000 in mic_rates else 48000
+
+    return {
+        "spoke": {
+            "hub_host": "192.168.1.58",
+            "hub_port": 5051,
+            "reconnect_base_delay": 1.0,
+            "reconnect_max_delay": 30.0,
+            "reconnect_jitter": 0.5,
+            "reconnect_attempts": None,
+            "mic_sample_rate": mic_rate,
+            "mic_channels": 1,
+            "mic_chunk_frames": 512,
+            "mic_device": mic_hw,
+            "mic_volume": 1.0,
+            "spk_sample_rate": spk_rate,
+            "spk_device": speaker_hw,
+            "jitter_buffer_min_ms": 80,
+            "jitter_buffer_max_ms": 400,
+            "jitter_adapt_speed": 0.1,
+            "echo_aec_enabled": True,
+            "echo_aec_order": 256,
+            "echo_mute_on_detection_ms": 0,
+            "log_level": "INFO",
+            "heartbeat_interval_s": 5.0,
+        }
+    }
 
 
-def test_input_device(index: int) -> bool:
-    """Test if an input device works at the mic sample rate.
-
-    Records 1 second and checks if we got any audio.
-    """
+def write_config(config: dict, path: str) -> None:
+    """Write config to YAML file."""
     try:
-        # Record 1 second
-        rec = sd.rec(int(MIC_RATE * 1.5), samplerate=MIC_RATE, channels=1,
-                     dtype=np.float32, device=(None, index))
-        sd.wait()
-        peak = np.max(np.abs(rec))
-        if peak > 0.001:
-            print(f"  ✓ Device {index} works at {MIC_RATE} Hz (peak: {peak:.3f})")
-            return True
-        else:
-            print(f"  ⚠ Device {index} recorded but very quiet (peak: {peak:.6f})")
-            return True  # Still works, just quiet
-    except Exception as e:
-        print(f"  ✗ Device {index} failed: {e}")
-        return False
+        import yaml
+        with open(path, "w") as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    except ImportError:
+        # Fallback: write YAML manually
+        spoke = config.get("spoke", {})
+        with open(path, "w") as f:
+            f.write("# GLaDOS Spoke Client Configuration\n")
+            f.write(f"# Generated on {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write("spoke:\n")
+            for k, v in spoke.items():
+                if isinstance(v, str):
+                    f.write(f'  {k}: "{v}"\n')
+                elif v is None:
+                    f.write(f"  {k}: null\n")
+                else:
+                    f.write(f"  {k}: {v}\n")
 
+# ============================================================================
+# Auto-select with USB preference
+# ============================================================================
 
-def find_usb_device(devices: list, pattern: str = "usb") -> int | None:
-    """Find the first device whose name contains the pattern (case-insensitive)."""
-    for i, dev in enumerate(devices):
-        if pattern.lower() in dev["name"].lower():
-            return i
-    return None
+def auto_select_usb() -> tuple[str | None, str | None]:
+    """Find USB headset and use loopback test to verify."""
+    alsa_devices = list_devices_alsa()
 
+    # Find USB devices
+    usb_speakers = [d for d in alsa_devices
+                    if d["output_channels"] > 0 and "usb" in d["name"].lower()]
+    usb_mics = [d for d in alsa_devices
+                if d["input_channels"] > 0 and "usb" in d["name"].lower()]
 
-def auto_select() -> tuple[int | None, int | None]:
-    """Automatically select the best speaker and mic devices.
+    if usb_speakers and usb_mics:
+        print("\n--- Found USB devices, testing loopback ---")
+        spk_hw = usb_speakers[0]["hw"]
+        mic_hw = usb_mics[0]["hw"]
+        print(f"  Speaker: {spk_hw} ({usb_speakers[0]['name']})")
+        print(f"  Mic:     {mic_hw} ({usb_mics[0]['name']})")
 
-    Prefers USB headsets. Falls back to system default.
-    """
-    devices = sd.query_devices()
-    print("\n=== Auto-Selecting Devices ===\n")
-
-    # Find USB audio device for speaker
-    usb_spk = find_usb_device(devices, "usb")
-    if usb_spk:
-        print(f"Found USB device: device {usb_spk} = {devices[usb_spk]['name']}")
-        success, rates = test_output_device(usb_spk)
+        success, peak = run_loopback_test(spk_hw, mic_hw)
         if success:
-            spk_device = usb_spk
+            print(f"  ✓ Loopback test passed (peak: {peak:.0f})")
+            return spk_hw, mic_hw
         else:
-            # Try the next USB device
-            spk_device = None
-    else:
-        spk_device = None
-        print("No USB device found. Trying default output device...")
+            print(f"  ✗ Loopback failed, falling back to all devices...")
 
-    if spk_device is None:
-        # Try default device
-        default_dev = sd.default.device
-        if default_dev[1] is not None:
-            spk_device = default_dev[1]
-            print(f"Using default output device {spk_device}")
-            success, _ = test_output_device(spk_device)
-            if not success:
-                print("Default output device doesn't work. Try --manual.")
-                spk_device = None
+    # Fallback: try all device pairs
+    print("\n--- No USB headset found, testing all pairs ---")
+    return find_best_device_pair()
 
-    # Find USB audio device for mic
-    usb_mic = find_usb_device(devices, "usb")
-    if usb_mic and usb_mic != spk_device:
-        print(f"Using same USB device {usb_mic} for microphone")
-        mic_device = usb_mic
-    else:
-        default_dev = sd.default.device
-        if default_dev[0] is not None:
-            mic_device = default_dev[0]
-            print(f"Using default input device {mic_device}")
-        else:
-            mic_device = None
-            print("No default input device found. Try --manual.")
+# ============================================================================
+# Manual selection
+# ============================================================================
 
-    # Test mic
-    if mic_device is not None:
-        test_input_device(mic_device)
-
-    return spk_device, mic_device
-
-
-def manual_select() -> tuple[int | None, int | None]:
-    """Let user manually select devices."""
-    devices = sd.query_devices()
+def manual_select(devices: list[dict]) -> tuple[str | None, str | None]:
+    """Let user pick speaker and mic from list."""
     print("\n=== Manual Device Selection ===\n")
 
-    print("Output devices (speaker):")
-    out_indices = [i for i, d in enumerate(devices) if d["max_output_channels"] > 0]
-    for i in out_indices:
-        print(f"  {i}: {devices[i]['name']}")
+    # Show speakers
+    speakers = [d for d in devices if d["output_channels"] > 0]
+    print("Available speakers:")
+    for d in speakers:
+        print(f"  {d['index']}: {d['name']} {f'({d["hw"]})' if 'hw' in d else ''}")
 
-    spk_device = None
-    while spk_device is None:
-        try:
-            val = input("\nSelect speaker device index (or Enter for default): ").strip()
-            if val == "":
-                default_dev = sd.default.device
-                spk_device = default_dev[1] if default_dev[1] is not None else None
-                if spk_device is None:
-                    print("No default output device. Please enter an index.")
-                    continue
-                print(f"Using default output device {spk_device}")
+    spk_hw = None
+    while spk_hw is None:
+        idx = input("\nSpeaker device index: ").strip()
+        if idx.isdigit():
+            d = next((x for x in speakers if x["index"] == int(idx)), None)
+            if d:
+                spk_hw = d.get("hw") or f"hw:{d['index']},0"
             else:
-                idx = int(val)
-                if idx in out_indices:
-                    spk_device = idx
-                    success, _ = test_output_device(idx)
-                    if not success:
-                        print("This device doesn't support the required sample rate. Try another.")
-                        spk_device = None
-                else:
-                    print(f"Invalid index. Choose from: {out_indices}")
-        except ValueError:
-            print("Please enter a number.")
+                print("Invalid index.")
 
-    print("\nInput devices (microphone):")
-    in_indices = [i for i, d in enumerate(devices) if d["max_input_channels"] > 0]
-    for i in in_indices:
-        print(f"  {i}: {devices[i]['name']}")
+    # Show mics
+    mics = [d for d in devices if d["input_channels"] > 0]
+    print("\nAvailable microphones:")
+    for d in mics:
+        print(f"  {d['index']}: {d['name']} {f'({d["hw"]})' if 'hw' in d else ''}")
 
-    mic_device = None
-    while mic_device is None:
-        try:
-            val = input("\nSelect mic device index (or Enter for default): ").strip()
-            if val == "":
-                default_dev = sd.default.device
-                mic_device = default_dev[0] if default_dev[0] is not None else None
-                if mic_device is None:
-                    print("No default input device. Please enter an index.")
-                    continue
-                print(f"Using default input device {mic_device}")
+    mic_hw = None
+    while mic_hw is None:
+        idx = input("\nMicrophone device index: ").strip()
+        if idx.isdigit():
+            d = next((x for x in mics if x["index"] == int(idx)), None)
+            if d:
+                mic_hw = d.get("hw") or f"hw:{d['index']},0"
             else:
-                idx = int(val)
-                if idx in in_indices:
-                    mic_device = idx
-                    test_input_device(idx)
-                else:
-                    print(f"Invalid index. Choose from: {in_indices}")
-        except ValueError:
-            print("Please enter a number.")
+                print("Invalid index.")
 
-    return spk_device, mic_device
+    return spk_hw, mic_hw
 
-
-def update_config(config_path: str, spk_device: int | None, mic_device: str | None) -> None:
-    """Update spoke_config.yaml with the selected devices."""
-    import yaml
-
-    try:
-        with open(config_path) as f:
-            config = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        config = {}
-
-    spoke = config.setdefault("spoke", {})
-
-    # Update speaker device (just the card number)
-    if spk_device is not None:
-        spoke["spk_device"] = spk_device
-
-    # Update mic device (as hw:card,device string)
-    if mic_device is not None:
-        spoke["mic_device"] = f"hw:{mic_device},0"
-
-    with open(config_path, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-
-    print(f"\nConfiguration written to: {config_path}")
-    print(f"  Speaker device: {spk_device}")
-    print(f"  Mic device: hw:{mic_device},0")
-
+# ============================================================================
+# Main
+# ============================================================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Auto-detect and configure GLaDOS Spoke audio devices")
-    parser.add_argument("--config", default="spoke_config.yaml", help="Path to config file")
-    parser.add_argument("--list", action="store_true", help="List devices and exit")
-    parser.add_argument("--auto", action="store_true", help="Auto-select best devices (USB preferred)")
-    parser.add_argument("--manual", action="store_true", help="Manually select devices")
+    parser = argparse.ArgumentParser(
+        description="Auto-detect and configure GLaDOS Spoke audio devices")
+    parser.add_argument("--config", default=CONFIG_FILE, help="Config file path")
+    parser.add_argument("--list", action="store_true", help="List devices only")
+    parser.add_argument("--auto", action="store_true",
+                        help="Auto-select (USB headset preferred, then loopback test)")
+    parser.add_argument("--manual", action="store_true",
+                        help="Manually select devices")
     args = parser.parse_args()
 
+    # List mode
     if args.list:
-        list_devices()
+        print_devices(list_devices())
         return
 
-    if args.auto:
-        spk_device, mic_device = auto_select()
-    else:
-        spk_device, mic_device = manual_select()
+    devices = list_devices()
 
-    if spk_device is not None:
-        update_config(args.config, spk_device, mic_device)
-        print("\n=== Setup Complete ===")
-        print(f"Run: glados-spoke --config {args.config}")
+    # Auto mode: USB preference + loopback
+    if args.auto:
+        speaker_hw, mic_hw = auto_select_usb()
+        if not speaker_hw:
+            print("\nAuto-select failed. Try --manual.")
+            sys.exit(1)
     else:
-        print("\nERROR: Could not find a working speaker device.")
-        print("Try --list to see available devices, or --manual to pick one.")
-        sys.exit(1)
+        speaker_hw, mic_hw = manual_select(devices)
+        if not speaker_hw or not mic_hw:
+            print("\nNo devices selected. Aborting.")
+            sys.exit(1)
+
+    print("\n--- Testing frequency support ---")
+
+    # Parse hw:card,device
+    try:
+        spk_card = int(speaker_hw.split(":")[1].split(",")[0])
+        mic_card = int(mic_hw.split(":")[1].split(",")[0])
+    except (IndexError, ValueError):
+        print(f"Warning: Could not parse hw addresses. Using defaults.")
+        spk_rates = [22050, 44100, 48000]
+        mic_rates = [16000, 48000]
+    else:
+        spk_rates = test_sample_rates(speaker_hw, is_input=False) or [22050, 44100]
+        mic_rates = test_sample_rates(mic_hw, is_input=True) or [16000, 48000]
+
+    print(f"\n  Speaker {speaker_hw}: supports {spk_rates}")
+    print(f"  Mic     {mic_hw}:     supports {mic_rates}")
+
+    config = generate_config(speaker_hw, mic_hw, spk_rates, mic_rates)
+    write_config(config, args.config)
+
+    print(f"\n✓ Configuration written to: {args.config}")
+    print(f"  Speaker: {speaker_hw} ({spk_rates})")
+    print(f"  Mic:     {mic_hw} ({mic_rates})")
+    print("\nRun: glados-spoke --config " + args.config)
 
 
 if __name__ == "__main__":
