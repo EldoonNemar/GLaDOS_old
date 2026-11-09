@@ -1,15 +1,16 @@
-"""WebSocket client with automatic reconnection — based on upstream reference client."""
+"""WebSocket client with automatic reconnection.
+
+Speaker playback uses sounddevice (no aplay/sox) and supports both MP3 and
+raw float32 PCM audio. The hub sends MP3 for smallest file size; the spoke
+decodes it with pygame and plays via sounddevice.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import io
 import logging
-import os
 import random
-import struct
-import subprocess
-import tempfile
 import time
 from typing import Any, Awaitable, Callable
 
@@ -21,38 +22,30 @@ import websockets
 logger = logging.getLogger(__name__)
 
 
-def _make_wav_header(num_samples: int, sample_rate: int = 22050, channels: int = 1) -> bytes:
-    """Create a minimal WAV header for raw float32 audio.
-
-    Uses IEEE float format (0x0003) which requires an 18-byte fmt subchunk
-    (the standard 16 bytes + 2-byte cbSize field).
-    """
-    byte_rate = sample_rate * channels * 4  # 4 bytes per float32
-    block_align = channels * 4
-    data_size = num_samples * block_align
-    header = struct.pack(
-        "<4sI4s4sIHHIIHHH4sI",
-        b"RIFF",
-        36 + data_size,
-        b"WAVE",
-        b"fmt ",
-        18,          # fmt subchunk size: 16 + 2 (cbSize)
-        3,           # 0x0003 = IEEE float
-        channels,
-        sample_rate,
-        byte_rate,
-        block_align,
-        32,          # bits per sample for float32
-        0,           # cbSize (extra bytes, 0 for IEEE float)
-        b"data",
-        data_size,
-    )
-    assert len(header) == 46
-    return header
-
-
 def _build_url(host: str, port: int, path: str) -> str:
     return f"ws://{host}:{port}{path}"
+
+
+def _decode_mp3_to_float32(mp3_data: bytes, sample_rate: int) -> np.ndarray:
+    """Decode MP3 bytes to a float32 numpy array suitable for sounddevice."""
+    try:
+        import pygame.mixer
+        import pygame.sndarray
+
+        pygame.mixer.init(frequency=sample_rate, size=-16, channels=1)
+        buffer = io.BytesIO(mp3_data)
+        sound = pygame.mixer.Sound(buffer)
+        samples = pygame.sndarray.array(sound)
+        pygame.mixer.uninit()
+        return (samples.astype(np.int16) / 32768.0).astype(np.float32).flatten()
+    except Exception as exc:
+        logger.warning("pygame MP3 decode failed (%s), treating as raw int16", exc)
+        return (np.frombuffer(mp3_data, dtype=np.int16) / 32768.0).astype(np.float32)
+
+
+def _decode_raw_float32(data: bytes, sample_rate: int) -> np.ndarray:
+    """Interpret bytes as raw float32 PCM."""
+    return np.frombuffer(data, dtype=np.float32)
 
 
 class ReconnectingWS:
@@ -126,45 +119,43 @@ class ReconnectingWS:
                 logger.exception("WS[%s]: error", self.url)
             if not self._running:
                 break
-            await asyncio.get_event_loop().run_in_executor(None, self._backoff_delay)
+            await self._backoff_delay()
 
     async def _one_connection(self) -> None:
-        async with websockets.connect(
-            self.url,
-            ping_interval=self.heartbeat_interval_s,
-            ping_timeout=self.heartbeat_interval_s * 3,
-            compression=None,
-        ) as ws:
-            self._ws = ws
-            self._attempt = 0
-            logger.info("WS[%s]: connected", self.url)
-            if self.on_open:
-                await self.on_open()
+        """Connect to the WebSocket server and handle messages."""
+        while self._running:
             try:
-                while self._running and ws.state.name == "OPEN":
-                    msg = await ws.recv()
-                    if isinstance(msg, bytes):
-                        await self._handle_binary(msg)
-                    else:
-                        await self._handle_text(msg)
-            except websockets.exceptions.ConnectionClosed:
-                pass
-            finally:
-                self._ws = None
+                ws = await websockets.connect(self.url)
+                self._ws = ws
+                self._attempt = 0
+                logger.info("WS[%s]: connected", self.url)
+                if self.on_open:
+                    await self.on_open()
+                try:
+                    async for msg in ws:
+                        if isinstance(msg, bytes):
+                            await self._handle_binary(msg)
+                        else:
+                            await self._handle_text(msg)
+                except websockets.exceptions.ConnectionClosed:
+                    logger.warning("WS[%s]: connection closed", self.url)
+                finally:
+                    self._ws = None
+            except (ConnectionRefusedError, OSError):
+                logger.debug("WS[%s]: connection failed", self.url)
+            await self._backoff_delay()
 
-    def _backoff_delay(self) -> None:
-        if self.reconnect_attempts is not None and self._attempt >= self.reconnect_attempts:
-            logger.error("WS[%s]: max reconnect attempts reached", self.url)
-            self._running = False
-            return
+    async def _backoff_delay(self) -> None:
+        """Exponential backoff with jitter before reconnecting."""
         self._attempt += 1
         delay = min(
             self.reconnect_base_delay * (2 ** (self._attempt - 1)),
             self.reconnect_max_delay,
         )
         jitter = random.uniform(0, delay * self.reconnect_jitter)
-        logger.info("WS[%s]: reconnecting in %.1fs (attempt %d)", self.url, delay + jitter, self._attempt)
-        time.sleep(delay + jitter)
+        total = delay + jitter
+        logger.info("WS[%s]: reconnecting in %.1fs (attempt %d)", self.url, total, self._attempt)
+        await asyncio.sleep(total)
 
     async def _handle_binary(self, data: bytes) -> None:
         pass
@@ -174,49 +165,45 @@ class ReconnectingWS:
 
 
 class MicClient(ReconnectingWS):
-    """Microphone client: streams float32 16 kHz audio to /microphone.
-
-    Uses an asyncio.Queue to bridge the PortAudio callback safely into the
-    asyncio event loop — matching the upstream reference client pattern.
-    """
+    """Microphone client: pushes PCM audio chunks to the hub."""
 
     def __init__(
         self,
         url: str,
-        *,
-        on_capture: Callable[[np.ndarray], None] | None = None,
+        on_capture: Callable[[bytes], Awaitable[None]],
         **kwargs: Any,
     ) -> None:
         super().__init__(url, **kwargs)
         self._on_capture = on_capture
-        self._out: asyncio.Queue[bytes] = asyncio.Queue(maxsize=8)
+        self._out: asyncio.Queue[bytes] = asyncio.Queue(maxsize=128)
 
     async def _handle_text(self, text: str) -> None:
         logger.debug("MicClient received: %s", text[:80])
 
+    async def _handle_binary(self, data: bytes) -> None:
+        raise NotImplementedError("MicClient does not expect binary frames")
+
     def push_sample(self, samples: np.ndarray) -> None:
-        """Called from the PortAudio callback thread."""
-        data = np.ascontiguousarray(samples, dtype=np.float32).tobytes()
-        if self._out.full():
-            self._out.get_nowait()
-            self._out.task_done()
-        self._out.put_nowait(data)
+        """Bridge from sounddevice callback into async send loop."""
+        if self._ws is not None and self._ws.state.name == "OPEN":
+            data = np.ascontiguousarray(samples, dtype=np.float32).tobytes()
+            asyncio.create_task(self._safe_send(data))
 
-    async def start(self) -> None:
-        await super().start()
-        self._sender_task = asyncio.create_task(self._sender())
-
-    async def stop(self) -> None:
-        if hasattr(self, "_sender_task"):
-            self._sender_task.cancel()
+    async def _safe_send(self, data: bytes) -> None:
+        if self._ws is not None and self._ws.state.name == "OPEN":
             try:
-                await self._sender_task
-            except asyncio.CancelledError:
+                await self._ws.send(data)
+            except Exception:
                 pass
-        await super().stop()
 
-    async def _sender(self) -> None:
-        """Send queued microphone blocks in capture order."""
+    async def _connect_loop(self) -> None:
+        """Start the connection loop AND the sender task."""
+        self._running = True
+        self._task = asyncio.create_task(self._one_connection())
+        self._sender_task = asyncio.create_task(self._sender_loop())
+
+    async def _sender_loop(self) -> None:
+        """Continuously drain the queue and send to the WebSocket."""
         while True:
             try:
                 data = await self._out.get()
@@ -230,12 +217,22 @@ class MicClient(ReconnectingWS):
             except Exception:
                 logger.exception("MicClient sender error")
 
+    async def stop(self) -> None:
+        self._running = False
+        if hasattr(self, "_sender_task"):
+            self._sender_task.cancel()
+            try:
+                await self._sender_task
+            except asyncio.CancelledError:
+                pass
+        await super().stop()
+
 
 class SpeakerClient(ReconnectingWS):
-    """Speaker client: receives TTS audio from /speaker and plays it via aplay.
+    """Speaker client: receives TTS audio from /speaker and plays it via sounddevice.
 
-    Replaces sounddevice with a simple subprocess pipeline:
-      WAV header + raw float32 → sox (float32 → 16-bit PCM) → aplay (plughw:4,0)
+    Accepts both MP3 and raw float32 PCM. The hub sends MP3 for smallest
+    file size; the spoke decodes it with pygame and plays via sounddevice.
     """
 
     def __init__(
@@ -249,73 +246,61 @@ class SpeakerClient(ReconnectingWS):
         self._current_sample_rate: int = 22050
         self._current_play_time: float = 0.0
         self._current_id: str | None = None
+        self._format: str = "raw"  # "mp3" or "raw"
         self._playback_lock = asyncio.Lock()
-
-    def _build_aplay_cmd(self) -> list[str]:
-        """Build the aplay command.
-        
-        Uses plughw:{spk_device},0 so audio goes to the correct USB headset.
-        Falls back to the system default (\"default\") if the configured device
-        is unavailable, and logs the device being used for debugging.
-        """
-        if self.spk_device is not None:
-            dev = f"plughw:{self.spk_device},0" if isinstance(self.spk_device, int) else str(self.spk_device)
-        else:
-            dev = "default"  # use ALSA default device instead of hardcoded index
-        logger.info("Speaker: using audio device %s", dev)
-        return ["aplay", "-D", dev, "-f", "S16_LE", "-r", "22050", "-c", "1"]
+        self._stop_playback = False
 
     async def _play(self, data: bytes, sample_rate: int) -> None:
-        """Play raw float32 audio via sox | aplay pipeline."""
+        """Decode and play audio via sounddevice."""
         if not data:
             return
 
-        num_samples = len(data) // 4  # 4 bytes per float32
-        wav = _make_wav_header(num_samples, sample_rate, 1) + data
+        # Detect format and decode
+        if self._format == "mp3":
+            samples = _decode_mp3_to_float32(data, sample_rate)
+        else:
+            samples = _decode_raw_float32(data, sample_rate)
 
-        aplay_cmd = self._build_aplay_cmd()
-        proc = subprocess.Popen(
-            ["sox", "-t", "wav", "-", "-t", "raw", "-r", "22050", "-c", "1", "-b", "16", "-e", "signed-integer", "-"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        aplay = subprocess.Popen(
-            aplay_cmd,
-            stdin=proc.stdout,
-            stderr=subprocess.PIPE,
-        )
+        if samples.size == 0:
+            return
+
+        logger.info("Speaker: playing %d samples (%.2fs) via sounddevice", len(samples), len(samples) / sample_rate)
+
+        # Respect play-time scheduling
+        scheduled_time = self._current_play_time
+        if scheduled_time > time.time():
+            await asyncio.sleep(max(0.0, scheduled_time - time.time()))
+
+        # Cancel on interruption
+        interrupted = False
+
         try:
-            proc.stdin.write(wav)
-            proc.stdin.close()
-            proc.wait(timeout=60)
-            aplay.wait(timeout=60)
-            if aplay.returncode != 0:
-                _, aplay_stderr = aplay.communicate()
-                logger.error("Speaker: aplay failed (rc=%d): %s", aplay.returncode, aplay_stderr.decode(errors="replace"))
-            if proc.returncode != 0:
-                _, proc_stderr = proc.communicate()
-                logger.error("Speaker: sox failed (rc=%d): %s", proc.returncode, proc_stderr.decode(errors="replace"))
+            sd.play(samples, sample_rate, device=self.spk_device)
+
+            # Wait for playback to finish or interruption
+            play_time_s = len(samples) / sample_rate
+            start = time.monotonic()
+            while not interrupted:
+                elapsed = time.monotonic() - start
+                if elapsed >= play_time_s:
+                    break
+                await asyncio.sleep(min(0.05, play_time_s - elapsed))
+
+            sd.stop()
         except Exception:
             logger.exception("Speaker: playback error")
-            try:
-                _, aplay_stderr = aplay.communicate(timeout=5)
-                logger.error("Speaker: aplay stderr: %s", aplay_stderr.decode(errors="replace"))
-            except Exception:
-                pass
         finally:
-            proc.kill()
-            aplay.kill()
-            proc.wait()
-            aplay.wait()
-        logger.info("Speaker: playback complete (%d samples)", num_samples)
+            self._stop_playback = False
+
+        logger.info("Speaker: playback complete (%d samples)", len(samples))
 
     async def _handle_binary(self, data: bytes) -> None:
         if not data:
             return
-        logger.info("Speaker: received %d bytes binary frame", len(data))
+        logger.info("Speaker: received %d bytes binary frame (%s)", len(data), self._format)
         async with self._playback_lock:
             try:
+                self._stop_playback = False
                 await self._play(data, self._current_sample_rate)
             except Exception:
                 logger.exception("SpeakerClient: error scheduling audio")
@@ -326,4 +311,8 @@ class SpeakerClient(ReconnectingWS):
         elif text.startswith("sampleRate:"):
             self._current_sample_rate = int(text.split(":", 1)[1])
         elif text == "reset":
-            pass
+            self._stop_playback = True
+            sd.stop()
+        elif text.startswith("format:"):
+            self._format = text.split(":", 1)[1].strip()
+            logger.info("Speaker: audio format set to %s", self._format)

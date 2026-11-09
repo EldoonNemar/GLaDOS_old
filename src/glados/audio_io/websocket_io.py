@@ -19,6 +19,27 @@ from . import VAD
 from .base import AudioIO
 
 
+def _encode_pcm_to_mp3(pcm: NDArray[np.float32], sample_rate: int) -> bytes:
+    """Encode raw PCM to MP3 using lame (if available).
+
+    Falls back to returning empty bytes if lame is not installed.
+    """
+    # Convert float32 [-1,1] to int16 for lame
+    pcm_int16 = (pcm.clip(-1.0, 1.0) * 32767).astype(np.int16).tobytes()
+    try:
+        import subprocess
+        proc = subprocess.Popen(
+            ["lame", "-r", "-s", str(sample_rate), "-c", "1", "-b", "24", "-m", "m", "-", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        mp3, _ = proc.communicate(input=pcm_int16, timeout=10)
+        return mp3 if proc.returncode == 0 else b""
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return b""
+
+
 @dataclass
 class AudioData:
     """
@@ -26,10 +47,12 @@ class AudioData:
     """
 
     data: NDArray[np.float32]
+    mp3_data: bytes | None = None
     sample_rate: int
     play_time: float
     play_time_monotonic: float
     track_id: uuid.UUID | None
+    audio_format: str = "raw"  # "raw" or "mp3"
 
 
 @dataclass
@@ -103,6 +126,7 @@ class WebsocketAudioIO(AudioIO):
         self._default_room_tag: str = self.DEFAULT_ROOM_TAG
         self._segregate_speakers: bool = self.SEGREGATE_SPEAKERS
         self._rooms: bool = self.ROOMS
+        self._mp3_enabled: bool = False
 
         if options is not None:
             for key in options:
@@ -130,6 +154,12 @@ class WebsocketAudioIO(AudioIO):
                             self._segregate_speakers = val
                         else:
                             raise ValueError("segregate_speakers must be a boolean value")
+                    case "mp3":
+                        if isinstance(val, bool):
+                            self._mp3_enabled = val
+                            logger.info("WebsocketAudioIO: MP3 %s for speaker output", "enabled" if val else "disabled")
+                        else:
+                            raise ValueError("mp3 must be a boolean value")
                     case _:
                         raise ValueError(f"Websocket backend: unsupported option '{key}'")
 
@@ -253,15 +283,25 @@ class WebsocketAudioIO(AudioIO):
 
         # Publish the payload and all associated state atomically. Speaker
         # tasks use _is_playing as the final "track is ready" indicator.
+        mp3_data = None
+        audio_format = "raw"
+        if self._mp3_enabled:
+            mp3_data = _encode_pcm_to_mp3(np.copy(audio_data), sample_rate)
+            if mp3_data:
+                audio_format = "mp3"
+                logger.info("Encoded %d samples → %d bytes MP3 (%.1fx compression)", len(audio_data), len(mp3_data), len(audio_data) * 4 / max(len(mp3_data), 1))
+
         with self._audio_lock:
             # allow for network jitter, time to websocket send, etc.
             sync_delay = self._speaker_sync_delay_ms / 1000
             self._audio_data = AudioData(
                 np.copy(audio_data),
+                mp3_data,
                 sample_rate,
                 time.time() + sync_delay,
                 time.monotonic() + sync_delay,
                 uuid.uuid4(),
+                audio_format,
             )
             self._stop_playback = False
             self._playback_was_interrupted = False
@@ -587,8 +627,13 @@ class WebsocketAudioIO(AudioIO):
                     continue
                 play_time = self._audio_data.play_time
                 sample_rate = self._audio_data.sample_rate
-                audio_data_bytes = self._audio_data.data.tobytes()
-                sample_count = len(self._audio_data.data)
+                audio_format = self._audio_data.audio_format
+                if audio_format == "mp3" and self._audio_data.mp3_data:
+                    audio_data_bytes = self._audio_data.mp3_data
+                    sample_count = len(audio_data_bytes)
+                else:
+                    audio_data_bytes = self._audio_data.data.tobytes()
+                    sample_count = len(self._audio_data.data)
                 current_track_id = self._audio_data.track_id
 
             # Audio with no track ID should not be played
@@ -596,12 +641,13 @@ class WebsocketAudioIO(AudioIO):
                 continue
 
             try:
-                # Send timestamp, then sample rate, then bytes
+                # Send format, timestamp, sample rate, then bytes
+                await websocket.send("format:" + audio_format)
                 await websocket.send("time:" + str(play_time))
                 await websocket.send("sampleRate:" + str(sample_rate))
                 await websocket.send(audio_data_bytes)
 
-                logger.debug(f"Playing audio with sample rate: {sample_rate} Hz, length: {sample_count} samples")
+                logger.debug(f"Playing audio {audio_format} with sample rate: {sample_rate} Hz, size: {sample_count} bytes")
             except websockets.exceptions.ConnectionClosed:
                 set_flags_once(current_track_id, True)
                 return

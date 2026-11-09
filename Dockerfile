@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
   g++ \
   libglib2.0-0 \
   git \
+  lame \
   && rm -rf /var/lib/apt/lists/*
 
 RUN pip install uv
