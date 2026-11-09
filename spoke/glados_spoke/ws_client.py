@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import os
 import random
+import struct
+import subprocess
+import tempfile
 import time
 from typing import Any, Awaitable, Callable
 
@@ -14,6 +19,31 @@ import websockets
 
 
 logger = logging.getLogger(__name__)
+
+
+def _make_wav_header(num_samples: int, sample_rate: int = 22050, channels: int = 1) -> bytes:
+    """Create a minimal WAV header for raw float32 audio."""
+    byte_rate = sample_rate * channels * 4  # 4 bytes per float32
+    block_align = channels * 4
+    data_size = num_samples * block_align
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        3,  # float
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        32,
+        b"data",
+        data_size,
+    )
+    assert len(header) == 44
+    return header
 
 
 def _build_url(host: str, port: int, path: str) -> str:
@@ -197,9 +227,10 @@ class MicClient(ReconnectingWS):
 
 
 class SpeakerClient(ReconnectingWS):
-    """Speaker client: receives TTS audio from /speaker and plays it.
+    """Speaker client: receives TTS audio from /speaker and plays it via aplay.
 
-    Matches the upstream reference client — no jitter buffer, just direct playback.
+    Replaces sounddevice with a simple subprocess pipeline:
+      WAV header + raw float32 → sox (float32 → 16-bit PCM) → aplay (plughw:4,0)
     """
 
     def __init__(
@@ -209,48 +240,60 @@ class SpeakerClient(ReconnectingWS):
         **kwargs: Any,
     ) -> None:
         super().__init__(url, **kwargs)
-        self.spk_device = spk_device
         self._current_sample_rate: int = 22050
         self._current_play_time: float = 0.0
-        self._playback_task: asyncio.Task[None] | None = None
+        self._current_id: str | None = None
+        self._playback_lock = asyncio.Lock()
 
-    async def _stop_playback(self) -> None:
-        """Cancel pending playback and stop the output device."""
-        if self._playback_task is None:
+    def _build_aplay_cmd(self) -> list[str]:
+        """Build the aplay command."""
+        if self.spk_device is not None:
+            dev = f"plughw:{self.spk_device},0" if isinstance(self.spk_device, int) else str(self.spk_device)
+        else:
+            dev = "plughw:4,0"
+        return ["aplay", "-D", dev, "-f", "S16_LE", "-r", "22050", "-c", "1"]
+
+    async def _play(self, data: bytes, sample_rate: int) -> None:
+        """Play raw float32 audio via sox | aplay pipeline."""
+        if not data:
             return
-        sd.stop()
-        self._playback_task.cancel()
+
+        num_samples = len(data) // 4  # 4 bytes per float32
+        wav = _make_wav_header(num_samples, sample_rate, 1) + data
+
+        aplay_cmd = self._build_aplay_cmd()
+        proc = subprocess.Popen(
+            ["sox", "-t", "wav", "-", "-t", "raw", "-r", "22050", "-c", "1", "-b", "16", "-e", "signed-integer", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        aplay = subprocess.Popen(
+            aplay_cmd,
+            stdin=proc.stdout,
+        )
         try:
-            await self._playback_task
-        except asyncio.CancelledError:
-            pass
-        self._playback_task = None
+            proc.stdin.write(wav)
+            proc.stdin.close()
+            proc.wait(timeout=60)
+            aplay.wait(timeout=60)
+        except Exception:
+            logger.exception("Speaker: playback error")
+        finally:
+            proc.kill()
+            aplay.kill()
+            proc.wait()
+            aplay.wait()
+        logger.info("Speaker: playback complete (%d samples)", num_samples)
 
     async def _handle_binary(self, data: bytes) -> None:
         if not data:
             return
         logger.info("Speaker: received %d bytes binary frame", len(data))
-        scheduled_time = self._current_play_time
-        rate = self._current_sample_rate
-        try:
-            await self._stop_playback()
-            self._playback_task = asyncio.create_task(self._play(data, scheduled_time, rate))
-        except Exception:
-            logger.exception("SpeakerClient: error scheduling audio")
-
-    async def _play(self, data: bytes, scheduled_time: float, sample_rate: int) -> None:
-        """Play one scheduled track and acknowledge its completion."""
-        wait_time = max(0.0, scheduled_time - time.time())
-        logger.info("Speaker: playing %d samples (%.1fs) at %d Hz, waiting %.2fs", len(data)//4, len(data)/4/sample_rate, sample_rate, wait_time)
-        await asyncio.sleep(wait_time)
-        sd.play(np.frombuffer(data, dtype=np.float32), sample_rate, device=self.spk_device)
-        await asyncio.to_thread(sd.wait)
-        logger.info("Speaker: playback complete")
-        try:
-            if self._ws and self._ws.state.name == "OPEN":
-                await self._ws.send("played")
-        except Exception:
-            pass
+        async with self._playback_lock:
+            try:
+                await self._play(data, self._current_sample_rate)
+            except Exception:
+                logger.exception("SpeakerClient: error scheduling audio")
 
     async def _handle_text(self, text: str) -> None:
         if text.startswith("time:"):
@@ -258,4 +301,4 @@ class SpeakerClient(ReconnectingWS):
         elif text.startswith("sampleRate:"):
             self._current_sample_rate = int(text.split(":", 1)[1])
         elif text == "reset":
-            await self._stop_playback()
+            pass
