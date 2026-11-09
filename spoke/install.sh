@@ -17,7 +17,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo "$0" "$@"
 fi
 
-apt-get update && apt-get install -y libspeex-dev libspeexdsp-dev libasound2-dev libportaudio2 libstdc++6 python3-venv swig g++
+apt-get update && apt-get install -y libspeex-dev libspeexdsp-dev libasound2-dev libportaudio2 libstdc++6 python3-venv swig g++ sox
 
 # Check if venv already exists
 if [ -d "$VENV_DIR" ]; then
