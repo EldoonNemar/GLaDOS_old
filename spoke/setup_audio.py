@@ -3,13 +3,9 @@
 
 Two-phase detection (mirrors human hearing):
 1. FIND THE MIC: Probe all capture devices, pick the best one
-   - USB headset preferred
-   - Falls back to highest ambient sound level
 2. FIND THE SPEAKER: Play tone through each playback device,
    record with the chosen mic. The device the mic hears is the answer.
 3. LOOPBACK VERIFY: Confirm the pair works together.
-
-No brute-force all-pairs. No assumptions. Fast and reliable.
 
 Usage:
     python setup_audio.py --auto
@@ -89,28 +85,45 @@ def find_capture_devices(card_count: int) -> list[dict]:
             hw = f"hw:{card},{dev}"
             tmp = f"/tmp/glados-capture-test.wav"
             try:
+                # Remove old file
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
                 p = subprocess.Popen(
                     ["arecord", "-D", hw, "-f", "S16_LE", "-r", "16000",
                      "-c", "1", "-d", "1", tmp],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                p.wait(timeout=5)
-                if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
+                stdout, stderr = p.communicate(timeout=5)
+                rc = p.returncode
+
+                has_file = os.path.exists(tmp)
+                file_size = os.path.getsize(tmp) if has_file else 0
+
+                if has_file and file_size > 44:  # WAV header is 44 bytes
                     with open(tmp, "rb") as f:
                         f.read(44)
                         raw = f.read()
-                    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-                    peak = float(np.max(np.abs(samples)))
-                    devices.append({
-                        "hw": hw,
-                        "name": f"{card_name} (hw:{card},{dev}) [in]",
-                        "card": card,
-                        "device": dev,
-                        "is_capture": True,
-                        "is_playback": False,
-                        "ambient_peak": peak,
-                    })
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                pass
+                    if len(raw) > 0:
+                        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                        peak = float(np.max(np.abs(samples)))
+                        devices.append({
+                            "hw": hw,
+                            "name": f"{card_name} (hw:{card},{dev}) [in]",
+                            "card": card,
+                            "device": dev,
+                            "is_capture": True,
+                            "is_playback": False,
+                            "ambient_peak": peak,
+                        })
+                        if peak > 5:
+                            print(f"  Found capture device: {hw} (peak: {peak:.0f})")
+
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+                print(f"  Capture probe {hw} failed: {e}")
+                continue
             finally:
                 try:
                     os.unlink(tmp)
@@ -129,9 +142,10 @@ def find_playback_devices(card_count: int) -> list[dict]:
                 p = subprocess.Popen(
                     ["speaker-test", "-t", "silence", "-l", "0",
                      "-c", "2", "-D", hw],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     start_new_session=True)
-                p.wait(timeout=3)
+                stdout, stderr = p.communicate(timeout=3)
                 if p.returncode == 0:
                     devices.append({
                         "hw": hw,
@@ -141,8 +155,9 @@ def find_playback_devices(card_count: int) -> list[dict]:
                         "is_capture": False,
                         "is_playback": True,
                     })
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                pass
+                    print(f"  Found playback device: {hw}")
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                print(f"  Playback probe {hw} failed: {e}")
             kill_speaker_test(hw)
     return devices
 
@@ -166,6 +181,12 @@ def print_devices(devices: list[dict]) -> None:
 
     if not speakers or not mics:
         print("ERROR: No usable devices found.")
+        if not mics:
+            print("\nTroubleshooting:")
+            print("  1. Check USB headset is plugged in: lsusb | grep -i audio")
+            print("  2. Check ALSA sees it: cat /proc/asound/cards")
+            print("  3. Test recording: arecord -D hw:4,0 -f S16_LE -r 16000 -c 1 -d 2 /tmp/test.wav")
+            print("  4. Try interactive: glados-spoke setup (choose option 2)")
         sys.exit(1)
 
 
@@ -178,12 +199,16 @@ def select_mic(mics: list[dict]) -> str:
         print("  Verifying...")
         tmp = f"/tmp/glados-mic-test.wav"
         try:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             p = subprocess.Popen(
                 ["arecord", "-D", usb_mic['hw'], "-f", "S16_LE", "-r", "16000",
                  "-c", "1", "-d", "2", tmp],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            p.wait(timeout=5)
-            if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = p.communicate(timeout=5)
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 44:
                 with open(tmp, "rb") as f:
                     f.read(44)
                     raw = f.read()
@@ -225,17 +250,22 @@ def select_speaker(speakers: list[dict], mic_hw: str) -> str:
 
         output = f"/tmp/glados-spk-test-{i}.wav"
         try:
+            try:
+                os.unlink(output)
+            except OSError:
+                pass
+
             spk_proc = subprocess.Popen(
                 ["speaker-test", "-t", "sine", "-f", "1000", "-l", "1",
                  "-c", "2", "-D", hw],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 start_new_session=True)
 
             rec_proc = subprocess.Popen(
                 ["arecord", "-D", mic_hw, "-f", "S16_LE", "-r", "16000",
                  "-c", "1", "-d", "3", output],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            rec_proc.wait(timeout=8)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = rec_proc.communicate(timeout=8)
 
             spk_proc.terminate()
             try:
@@ -243,7 +273,7 @@ def select_speaker(speakers: list[dict], mic_hw: str) -> str:
             except subprocess.TimeoutExpired:
                 spk_proc.kill()
 
-            if os.path.exists(output) and os.path.getsize(output) > 0:
+            if os.path.exists(output) and os.path.getsize(output) > 44:
                 with open(output, "rb") as f:
                     f.read(44)
                     raw = f.read()
@@ -281,23 +311,27 @@ def select_speaker(speakers: list[dict], mic_hw: str) -> str:
 def loopback_verify(speaker_hw: str, mic_hw: str) -> tuple[bool, float]:
     output = "/tmp/glados-loopback-verify.wav"
     try:
+        try:
+            os.unlink(output)
+        except OSError:
+            pass
         spk = subprocess.Popen(
             ["speaker-test", "-t", "sine", "-f", "1000", "-l", "1",
              "-c", "2", "-D", speaker_hw],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True)
         rec = subprocess.Popen(
             ["arecord", "-D", mic_hw, "-f", "S16_LE", "-r", "16000",
              "-c", "1", "-d", "4", output],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        rec.wait(timeout=8)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = rec.communicate(timeout=8)
         spk.terminate()
         try:
             spk.wait(timeout=3)
         except subprocess.TimeoutExpired:
             spk.kill()
 
-        if not os.path.exists(output):
+        if not os.path.exists(output) or os.path.getsize(output) <= 44:
             return False, 0.0
 
         with open(output, "rb") as f:
@@ -322,12 +356,16 @@ def test_rates(hw: str, is_capture: bool) -> list[int]:
         try:
             if is_capture:
                 tmp = f"/tmp/glados-rate-{rate}.wav"
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
                 p = subprocess.Popen(
                     ["arecord", "-D", hw, "-r", str(rate), "-f", "S16_LE",
                      "-c", "1", "-d", "1", tmp],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                p.wait(timeout=5)
-                if p.returncode == 0:
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout, stderr = p.communicate(timeout=5)
+                if p.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 44:
                     rates.append(rate)
                 try:
                     os.unlink(tmp)
@@ -337,9 +375,9 @@ def test_rates(hw: str, is_capture: bool) -> list[int]:
                 p = subprocess.Popen(
                     ["speaker-test", "-t", "silence", "-r", str(rate),
                      "-l", "0", "-c", "2", "-D", hw],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     start_new_session=True)
-                p.wait()
+                stdout, stderr = p.communicate(timeout=3)
                 if p.returncode == 0:
                     rates.append(rate)
                 kill_speaker_test(hw)
@@ -403,13 +441,16 @@ def main() -> None:
     print(f"\n=== GLaDOS Spoke Audio Setup ===")
     print(f"Detected {card_count} ALSA cards\n")
 
+    print("Phase 1: Probing capture devices...")
     capture_devices = find_capture_devices(card_count)
+    print(f"  Found {len(capture_devices)} capture device(s)\n")
+
+    print("Phase 1: Probing playback devices...")
     playback_devices = find_playback_devices(card_count)
+    print(f"  Found {len(playback_devices)} playback device(s)\n")
 
     if not capture_devices or not playback_devices:
-        print("ERROR: No usable audio devices found.")
-        print("Check that your USB headset is plugged in and recognized.")
-        sys.exit(1)
+        print_devices([])  # This will exit
 
     devices = capture_devices + playback_devices
     print_devices(devices)
