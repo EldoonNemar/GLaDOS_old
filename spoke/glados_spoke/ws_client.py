@@ -221,10 +221,18 @@ class MicClient(ReconnectingWS):
         raise NotImplementedError("MicClient does not expect binary frames")
 
     def push_sample(self, samples: np.ndarray) -> None:
-        """Bridge from sounddevice callback into async send loop."""
-        if self._ws is not None and self._ws.state.name == "OPEN":
-            data = np.ascontiguousarray(samples, dtype=np.float32).tobytes()
-            asyncio.create_task(self._safe_send(data))
+        """Bridge from sounddevice callback into async send loop.
+
+        Thread-safe: uses Queue.put_nowait() which is safe to call from
+        the sounddevice callback thread.
+        """
+        if self._ws is None or self._ws.state.name != "OPEN":
+            return
+        data = np.ascontiguousarray(samples, dtype=np.float32).tobytes()
+        if self._out.full():
+            self._out.get_nowait()  # discard oldest to bound latency
+            self._out.task_done()
+        self._out.put_nowait(data)
 
     async def _safe_send(self, data: bytes) -> None:
         if self._ws is not None and self._ws.state.name == "OPEN":
