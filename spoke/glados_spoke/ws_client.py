@@ -249,11 +249,13 @@ class SpeakerClient(ReconnectingWS):
     def _build_aplay_cmd(self) -> list[str]:
         """Build the aplay command.
         
-        Uses 'default' ALSA device which goes through dmix for concurrent
-        access — essential when mic capture (sounddevice) and playback
-        (aplay) run simultaneously on the same USB headset.
+        Uses plughw:{spk_device},0 so audio goes to the correct USB headset.
         """
-        return ["aplay", "-D", "default", "-f", "S16_LE", "-r", "22050", "-c", "1"]
+        if self.spk_device is not None:
+            dev = f"plughw:{self.spk_device},0" if isinstance(self.spk_device, int) else str(self.spk_device)
+        else:
+            dev = "plughw:4,0"  # default to USB headset
+        return ["aplay", "-D", dev, "-f", "S16_LE", "-r", "22050", "-c", "1"]
 
     async def _play(self, data: bytes, sample_rate: int) -> None:
         """Play raw float32 audio via sox | aplay pipeline."""
