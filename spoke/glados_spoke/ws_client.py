@@ -356,7 +356,7 @@ class SpeakerClient(ReconnectingWS):
         interrupted = False
 
         try:
-            sd.play(samples, sample_rate, device=self.spk_device)
+            sd.play(samples, sample_rate or 22050, device=self.spk_device)
 
             # Wait for playback to finish or interruption
             play_time_s = len(samples) / sample_rate
@@ -390,7 +390,7 @@ class SpeakerClient(ReconnectingWS):
         if text.startswith("time:"):
             self._current_play_time = float(text.split(":", 1)[1])
         elif text.startswith("sampleRate:"):
-            self._current_sample_rate = int(text.split(":", 1)[1])
+            self._current_sample_rate = int(text.split(":", 1)[1] or 22050)
         elif text == "reset":
             self._stop_playback = True
             sd.stop()
