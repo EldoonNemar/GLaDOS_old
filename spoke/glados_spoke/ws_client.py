@@ -352,6 +352,8 @@ class SpeakerClient(ReconnectingWS):
         self._format: str = "raw"  # "mp3" or "raw"
         self._playback_lock = asyncio.Lock()
         self._stop_playback = False
+        # Cached working sample rate found by probing at startup
+        self._working_rate: int | None = None
 
     def _get_supported_rates(self) -> list[int]:
         """Return sample rates this speaker device supports, in preference order."""
@@ -368,27 +370,66 @@ class SpeakerClient(ReconnectingWS):
             pass
         return [22050, 16000, 44100]
 
+    def _probe_working_rate(self) -> int | None:
+        """Probe the speaker device to find a working sample rate.
+
+        Tests each candidate rate with a short silent burst. Returns
+        the first rate that successfully opens the stream, or None.
+        """
+        import numpy as np
+        import sounddevice as sd  # noqa: F811
+
+        # Use a tiny silent buffer (0.05 s) for each probe
+        duration = 0.05
+        for rate in self._get_supported_rates():
+            try:
+                silent = np.zeros(int(rate * duration), dtype=np.float32)
+                stream = sd.OutputStream(samplerate=rate, channels=1, blocksize=256)
+                stream.start()
+                stream.write(silent)
+                stream.stop()
+                stream.close()
+                logger.info("Speaker: probed working sample rate %d Hz", rate)
+                return rate
+            except Exception:
+                logger.debug("Speaker: probe failed at %d Hz", rate)
+                continue
+        logger.warning("Speaker: no working sample rate found via probe")
+        return None
+
     async def on_open(self) -> None:
         """Send our supported sample rates on connection."""
+        # Probe for a working sample rate once at startup
+        self._working_rate = self._probe_working_rate()
+        if self._working_rate:
+            self._current_sample_rate = self._working_rate
+
         rates = self._get_supported_rates()
         await self.send("capabilities:" + ",".join(str(r) for r in rates))
-        logger.info("Speaker: advertised supported rates {}", rates)
+        logger.info("Speaker: advertised supported rates {}, working rate {}",
+                    rates, self._working_rate)
 
     async def _play(self, data: bytes, sample_rate: int) -> None:
-        """Decode and play audio via sounddevice, with sample rate fallback."""
+        """Decode and play audio via sounddevice, using cached working rate."""
         if not data:
             return
 
+        # Use cached working rate as primary; hub rate is only a suggestion
+        if self._working_rate:
+            effective_rate = self._working_rate
+        else:
+            effective_rate = sample_rate
+
         # Detect format and decode
         if self._format == "mp3":
-            samples = _decode_mp3_to_float32(data, sample_rate)
+            samples = _decode_mp3_to_float32(data, effective_rate)
         else:
-            samples = _decode_raw_float32(data, sample_rate)
+            samples = _decode_raw_float32(data, effective_rate)
 
         if samples.size == 0:
             return
 
-        logger.info("Speaker: playing %d samples (%.2fs) via sounddevice", len(samples), len(samples) / sample_rate)
+        logger.info("Speaker: playing %d samples (%.2fs) via sounddevice", len(samples), len(samples) / effective_rate)
 
         # Respect play-time scheduling
         scheduled_time = self._current_play_time
@@ -399,13 +440,14 @@ class SpeakerClient(ReconnectingWS):
         interrupted = False
         played = False
 
-        # Try playback at the negotiated rate first, then fall back to supported rates
-        rates_to_try = [sample_rate] + [r for r in self._get_supported_rates() if r != sample_rate]
+        # Try working rate first, then other supported rates as fallback
+        rates_to_try = [effective_rate] + [r for r in self._get_supported_rates()
+                                            if r != effective_rate and r != sample_rate]
 
         for try_rate in rates_to_try:
-            if try_rate != sample_rate:
+            if try_rate != effective_rate:
                 logger.info("Speaker: resampling to %d Hz (fallback)", try_rate)
-                samples = _resample_audio(samples, sample_rate, try_rate)
+                samples = _resample_audio(samples, effective_rate, try_rate)
 
             if self._stop_playback:
                 break
