@@ -47,11 +47,11 @@ class AudioData:
     """
 
     data: NDArray[np.float32]
-    mp3_data: bytes | None = None
     sample_rate: int
     play_time: float
     play_time_monotonic: float
-    track_id: uuid.UUID | None
+    mp3_data: bytes | None = None
+    track_id: uuid.UUID | None = None
     audio_format: str = "raw"  # "raw" or "mp3"
 
 
