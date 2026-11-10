@@ -76,7 +76,7 @@ try:
     logger.remove(0)
 except ValueError:
     pass  # Handler already removed (e.g., by TUI)
-logger.add(sys.stderr, level="INFO")
+logger.add(sys.stderr, level="SUCCESS")
 
 
 @dataclass(frozen=True)
