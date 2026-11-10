@@ -13,6 +13,47 @@ from ..utils import spoken_text_converter as stc
 from .audio_data import AudioMessage
 from .speech_markup import SpeechMarkupParser, SpeechText
 
+# Known system prompt / meta-text patterns that should never be spoken.
+# These are phrases from emotion_state.py, engine.py prompts etc. that
+# the LLM may leak into its output.
+_SYSTEM_PROMPT_PATTERNS: frozenset[str] = frozenset({
+    # emotion_state.py response instructions
+    "Current tone guidance",
+    "Background expression suggestion",
+    "React naturally to the CURRENT input, which can change the immediate tone and expression.",
+    "Stored mood is context, not a requirement to match your opening expression.",
+    "Preserve useful, accurate answers even when irritated.",
+    "Emotion markers control animation, not PAD.",
+    "Keep confident authority.",
+    "Show uncertainty when appropriate.",
+    # Common system prompt labels and phrases
+    "user.",
+    "assistant.",
+    "system.",
+    "search.",
+    "Continuing mood",
+    "Current tone guidance:",
+    "Background expression suggestion:",
+})
+
+
+def _is_system_prompt_leak(text: str) -> bool:
+    """Check if the text looks like a leaked system prompt segment.
+
+    Returns True if the segment should be skipped (it's meta-text from
+    the system prompt that the LLM echoed into its response).
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+    # Exact match against known system prompt phrases
+    if stripped in _SYSTEM_PROMPT_PATTERNS:
+        return True
+    # Single word followed by optional period (e.g., "system.", "user.", "bored.")
+    if re.fullmatch(r'[a-zA-Z]+ *\.?', stripped):
+        return True
+    return False
+
 
 class TextToSpeechSynthesizer:
     """
@@ -98,6 +139,10 @@ class TextToSpeechSynthesizer:
                                 or not self._autonomy_current(autonomy_epoch)):
                             break
                         if not segment.text.strip():
+                            continue
+                        # Skip segments that look like leaked system prompt content
+                        if _is_system_prompt_leak(segment.text):
+                            logger.debug("TTS: skipping system prompt leak: %s", segment.text)
                             continue
                         logger.info(f"LLM text: {segment.text}")
                         if self._observability_bus:
