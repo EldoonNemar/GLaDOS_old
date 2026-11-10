@@ -368,6 +368,20 @@ class SpeakerClient(ReconnectingWS):
                 await asyncio.sleep(min(0.05, play_time_s - elapsed))
 
             sd.stop()
+        except sd.PortAudioError as e:
+            # Device doesn't support the requested sample rate — resample to 16000
+            logger.warning("Playback failed (%s), resampling to 16000 Hz", e)
+            from scipy import signal as scipy_signal
+            samples = scipy_signal.resample_poly(samples, 16000, sample_rate or 22050).astype(np.float32)
+            sd.play(samples, 16000, device=self.spk_device)
+            play_time_s = len(samples) / 16000
+            start = time.monotonic()
+            while not interrupted:
+                elapsed = time.monotonic() - start
+                if elapsed >= play_time_s:
+                    break
+                await asyncio.sleep(min(0.05, play_time_s - elapsed))
+            sd.stop()
         except Exception:
             logger.exception("Speaker: playback error")
         finally:
