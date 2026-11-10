@@ -484,11 +484,172 @@ def write_config(spk_hw: str, mic_hw: str, spk_rates: list[int],
                     f.write(f"  {k}: {v}\n")
 
 
+def list_available_devices(card_count: int, hdmis_connected: dict,
+                            usb_conference_mic: int | None) -> tuple[list[dict], list[dict]]:
+    """Discover all available mic/speaker devices without verification."""
+    print("=== Available Microphones ===")
+    mic_devices = []
+    for card in range(card_count):
+        card_name = get_card_name(card)
+        for dev in range(MAX_DEVICES_PER_CARD):
+            hw = f"hw:{card},{dev}"
+            success, peak, err = test_capture_device(hw)
+            if success:
+                tag = " [USB]" if is_usb_device(card_name) else ""
+                print(f"  [{card},{dev}] {hw} ({card_name}) peak={peak:.0f}{tag}")
+                mic_devices.append({"hw": hw, "name": card_name, "card": card, "dev": dev, "peak": peak, "is_usb": is_usb_device(card_name)})
+            else:
+                print(f"  [{card},{dev}] {hw}: {err}")
+    if not mic_devices:
+        print("  No working microphones found.")
+
+    print("\n=== Available Speakers ===")
+    spk_devices = []
+    for card in range(card_count):
+        card_name = get_card_name(card)
+        if not hdmis_connected.get(card, False):
+            if is_hdm_device(card_name) or card in [0, 1, 4]:
+                print(f"  [{card},*] {card_name}: skipping (disconnected)")
+                continue
+        for dev in range(MAX_DEVICES_PER_CARD):
+            hw = f"hw:{card},{dev}"
+            output = f"/tmp/glados-spk-{hw.replace(',', '-')}.wav"
+            try:
+                try:
+                    os.unlink(output)
+                except OSError:
+                    pass
+                spk = subprocess.Popen(
+                    ["speaker-test", "-t", "sine", "-f", "1000", "-l", "1",
+                     "-c", "2", "-D", hw],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    start_new_session=True)
+                time.sleep(0.5)
+                tmp = f"/tmp/glados-rec-{hw.replace(',', '-')}.wav"
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                rec = subprocess.Popen(
+                    ["arecord", "-D", hw, "-f", "S16_LE", "-r", "16000",
+                     "-c", "1", "-d", "2", tmp],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout, stderr = rec.communicate(timeout=5)
+                spk.terminate()
+                try:
+                    spk.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    spk.kill()
+                if not os.path.exists(output) or os.path.getsize(output) <= 200:
+                    continue
+                with open(output, "rb") as f:
+                    f.read(44)
+                    raw = f.read()
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                peak = float(np.max(np.abs(samples)))
+                if peak >= 100:
+                    tag = " [USB]" if is_usb_device(card_name) else ""
+                    print(f"  [{card},{dev}] {hw} ({card_name}) detected peak={peak:.0f}{tag}")
+                    spk_devices.append({"hw": hw, "name": card_name, "card": card, "dev": dev, "peak": peak, "is_usb": is_usb_device(card_name)})
+            except subprocess.TimeoutExpired:
+                try:
+                    spk.terminate()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.unlink(output)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(tmp)
+                except (OSError, NameError):
+                    pass
+    if not spk_devices:
+        print("  No speakers detected (tone not heard by mic).")
+    return mic_devices, spk_devices
+
+
+def manual_select(card_count: int, args) -> None:
+    """Interactive manual selection of microphone and speaker."""
+    hdmis_connected, usb_conference_mic = get_hardware_info(card_count)
+    if usb_conference_mic is not None:
+        usb_name = get_card_name(usb_conference_mic)
+        print(f"USB conference mic detected on card {usb_conference_mic} ({usb_name})")
+    mic_devices, spk_devices = list_available_devices(card_count, hdmis_connected, usb_conference_mic)
+    if not mic_devices:
+        print("\nERROR: No working microphone found.")
+        sys.exit(1)
+    if not spk_devices:
+        print("\nERROR: No speaker detected by the microphone.")
+        print("Try: glados-spoke setup --auto")
+        sys.exit(1)
+
+    print("\n=== Select Microphone ===")
+    print("Enter the card number for your microphone (0-{}):".format(card_count - 1))
+    for i, mic in enumerate(mic_devices):
+        tag = " [USB]" if mic["is_usb"] else ""
+        print(f"  {i + 1}. hw:{mic['card']},{mic['dev']} ({mic['name']}) peak={mic['peak']:.0f}{tag}")
+    while True:
+        try:
+            choice = input("Mic selection> ").strip()
+            idx = int(choice) - 1
+            if 0 <= idx < len(mic_devices):
+                break
+        except (ValueError, EOFError):
+            pass
+        print("Invalid selection. Please try again.")
+    selected_mic = mic_devices[idx]
+    mic_hw = selected_mic["hw"]
+    print(f"\nSelected mic: {mic_hw} ({selected_mic['name']})")
+
+    print("\n=== Select Speaker ===")
+    print("Enter the card number for your speaker (0-{}):".format(card_count - 1))
+    for i, spk in enumerate(spk_devices):
+        tag = " [USB]" if spk["is_usb"] else ""
+        print(f"  {i + 1}. hw:{spk['card']},{spk['dev']} ({spk['name']}) peak={spk['peak']:.0f}{tag}")
+    while True:
+        try:
+            choice = input("Speaker selection> ").strip()
+            idx = int(choice) - 1
+            if 0 <= idx < len(spk_devices):
+                break
+        except (ValueError, EOFError):
+            pass
+        print("Invalid selection. Please try again.")
+    selected_spk = spk_devices[idx]
+    spk_hw = selected_spk["hw"]
+    print(f"\nSelected speaker: {spk_hw} ({selected_spk['name']})")
+
+    print("\n=== Verifying Pair ===")
+    ok, peak = loopback_verify(spk_hw, mic_hw)
+    if ok:
+        print(f"  Verified (peak: {peak:.0f})")
+    else:
+        print("  Warning: Verification failed. You may need to adjust volumes.")
+
+    print("\n=== Testing Sample Rates ===")
+    spk_rates = test_rates(spk_hw, False)
+    mic_rates = test_rates(mic_hw, True)
+    print(f"  Speaker {spk_hw}: {spk_rates or [22050, 44100]}")
+    print(f"  Mic     {mic_hw}: {mic_rates or [16000]}")
+
+    write_config(spk_hw, mic_hw, spk_rates or [22050, 44100],
+                 mic_rates or [16000], args.config)
+    print(f"\nConfig written: {args.config}")
+    print(f"  Speaker: {spk_hw}  ({selected_spk['name']})")
+    print(f"  Mic:     {mic_hw}  ({selected_mic['name']})")
+    print(f"\nRun: glados-spoke run --config {args.config}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="GLaDOS Spoke audio setup")
     parser.add_argument("--config", default=CONFIG_FILE)
-    parser.add_argument("--list", action="store_true")
-    parser.add_argument("--auto", action="store_true")
+    parser.add_argument("--list", action="store_true", help="List available devices only")
+    parser.add_argument("--auto", action="store_true", help="Auto-detect best devices (USB preferred)")
+    parser.add_argument("--manual", action="store_true", help="Manually select devices interactively")
     args = parser.parse_args()
 
     missing = check_tools()
@@ -500,9 +661,19 @@ def main() -> None:
     card_count = get_card_count()
     print(f"\n=== GLaDOS Spoke Audio Setup ===")
     print(f"Detected {card_count} ALSA cards\n")
-    
-    # Get hardware info for smart speaker detection
+
     hdmis_connected, usb_conference_mic = get_hardware_info(card_count)
+
+    if args.list:
+        mic_devices, spk_devices = list_available_devices(card_count, hdmis_connected, usb_conference_mic)
+        print(f"\nTotal microphones found: {len(mic_devices)}")
+        print(f"Total speakers found: {len(spk_devices)}")
+        return
+
+    if args.manual:
+        manual_select(card_count, args)
+        return
+
     if usb_conference_mic is not None:
         usb_name = get_card_name(usb_conference_mic)
         print(f"USB conference mic detected on card {usb_conference_mic} ({usb_name})")
@@ -525,9 +696,9 @@ def main() -> None:
     print("\n=== Phase 3: Verifying Pair ===")
     ok, peak = loopback_verify(spk_hw, mic_hw)
     if ok:
-        print(f"  ✓ Verified (peak: {peak:.0f})")
+        print(f"  Verified (peak: {peak:.0f})")
     else:
-        print("  ✗ Verification failed.")
+        print("  Verification failed.")
         sys.exit(1)
 
     print("\n=== Testing Sample Rates ===")
