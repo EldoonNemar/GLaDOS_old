@@ -155,6 +155,7 @@ class GladosConfig(BaseModel):
     mcp_servers: list[MCPServerConfig] | None = None
     webapp: WebappConfig | None = None
     echo: dict[str, Any] | None = None
+    log_level: str = "SUCCESS"  # Logging level: DEBUG, INFO, SUCCESS, WARNING, ERROR
 
     @model_validator(mode="after")
     def _validate_native_audio(self) -> "GladosConfig":

@@ -1,4 +1,5 @@
 Glados:
+  log_level: SUCCESS  # DEBUG, INFO, SUCCESS, WARNING, ERROR
   inference:
     slots: 4  # Match llama-server --parallel 4, with -c 65536 (16K per slot).
     reserved_interactive: 2  # Conversation and routing; background jobs share two slots.

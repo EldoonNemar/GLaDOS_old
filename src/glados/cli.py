@@ -233,6 +233,15 @@ def start(
         updates["asr_muted"] = asr_muted
     if updates:
         glados_config = glados_config.model_copy(update=updates)
+
+    # Apply configured log level
+    try:
+        from loguru import logger
+        logger.remove(0)
+        logger.add(sys.stderr, level=glados_config.log_level.upper())
+    except Exception:
+        pass  # Logging config is non-critical
+
     glados = Glados.from_config(glados_config)
     if glados.announcement:
         glados.play_announcement()
@@ -301,6 +310,14 @@ def run_webapp(
         updates["asr_muted"] = asr_muted
     if updates:
         glados_config = glados_config.model_copy(update=updates)
+
+    # Apply configured log level
+    try:
+        from loguru import logger
+        logger.remove(0)
+        logger.add(sys.stderr, level=glados_config.log_level.upper())
+    except Exception:
+        pass  # Logging config is non-critical
 
     webapp_config = glados_config.webapp
     if webapp_config is None or not webapp_config.enabled:
