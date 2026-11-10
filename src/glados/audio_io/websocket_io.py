@@ -160,6 +160,12 @@ class WebsocketAudioIO(AudioIO):
                             logger.info("WebsocketAudioIO: MP3 %s for speaker output", "enabled" if val else "disabled")
                         else:
                             raise ValueError("mp3 must be a boolean value")
+                    case "vad_threshold":
+                        val = float(val)
+                        if not 0 <= val <= 1:
+                            raise ValueError("vad_threshold must be between 0 and 1")
+                        self.vad_threshold = val
+                        logger.info("WebsocketAudioIO: VAD threshold set to %.2f", val)
                     case _:
                         raise ValueError(f"Websocket backend: unsupported option '{key}'")
 
