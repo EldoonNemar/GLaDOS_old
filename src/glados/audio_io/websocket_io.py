@@ -127,7 +127,7 @@ class WebsocketAudioIO(AudioIO):
         self._default_room_tag: str = self.DEFAULT_ROOM_TAG
         self._segregate_speakers: bool = self.SEGREGATE_SPEAKERS
         self._rooms: bool = self.ROOMS
-        self._mp3_enabled: bool = False
+        self._mp3_enabled: bool = True
 
         if options is not None:
             for key in options:
@@ -581,18 +581,29 @@ class WebsocketAudioIO(AudioIO):
                 return False
             elif isinstance(ws_msg, str) and ws_msg.startswith("capabilities:"):
                 nonlocal speaker_sample_rate
-                # Parse "capabilities:16000,22050,44100" — pick first rate hub also supports
+                # Parse capabilities -- prefer 16000 for max compatibility with
+                # embedded speakers (XVF3800, etc.).
                 rates_str = ws_msg.split(":", maxsplit=1)[1]
                 supported = [int(r.strip()) for r in rates_str.split(",") if r.strip().isdigit()]
                 # Hub supports: TTS rate (22050) and mic rate (16000)
                 hub_rates = {self.SAMPLE_RATE, self.VAD_SAMPLE_RATE}
-                for rate in supported:
-                    if rate in hub_rates:
-                        speaker_sample_rate = rate
-                        logger.info("Speaker {}: negotiated sample rate {}", websocket.remote_address, rate)
-                        break
+                # Prefer 16000 when available for broader hardware compatibility
+                preferred = [r for r in supported if r in hub_rates and r == self.VAD_SAMPLE_RATE]
+                if preferred:
+                    speaker_sample_rate = preferred[0]
+                    logger.info("Speaker {}: negotiated sample rate {} (preferred 16k)",
+                              websocket.remote_address, speaker_sample_rate)
                 else:
-                    logger.warning("Speaker {}: no compatible rate in {}", websocket.remote_address, supported)
+                    for rate in supported:
+                        if rate in hub_rates:
+                            speaker_sample_rate = rate
+                            logger.info("Speaker {}: negotiated sample rate {}",
+                                      websocket.remote_address, rate)
+                            break
+                    else:
+                        speaker_sample_rate = self.VAD_SAMPLE_RATE  # fallback
+                        logger.warning("Speaker {}: no compatible rate in {}, defaulting to 16000",
+                                     websocket.remote_address, supported)
                 return False
             return True
 
