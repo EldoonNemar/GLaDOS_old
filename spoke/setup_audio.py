@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import subprocess
 import sys
@@ -70,6 +71,54 @@ def is_usb_device(card_name: str) -> bool:
     return ("usb" in lower or "pdp" in lower or "jabra" in lower or
             "plantronics" in lower or "logitech" in lower or
             "blue" in lower or "steelseries" in lower)
+
+
+def check_hdmis_connected() -> dict:
+    """Check which HDMI outputs are connected to a monitor.
+    
+    Returns dict mapping card number to True if connected.
+    """
+    connected = {}
+    try:
+        for card_num in range(10):
+            drm_dir = f"/sys/class/drm/card{card_num}-HDMI-A-*"
+            for fpath in glob.glob(drm_dir):
+                try:
+                    with open(fpath + "/status") as f:
+                        status = f.read().strip()
+                    if status == "connected":
+                        connected[card_num] = True
+                except (FileNotFoundError, IOError):
+                    pass
+    except Exception:
+        pass
+    return connected
+
+
+def is_hdm_device(card_name: str) -> bool:
+    """Check if card is an HDMI output device."""
+    lower = card_name.lower()
+    return any(kw in lower for kw in ["hdmi", "hdmiout"])
+
+
+def get_hardware_info(card_count: int) -> tuple[dict, int | None]:
+    """Get HDMI connection status and USB conference mic info.
+    
+    Returns (hdmis_connected, usb_conference_mic_card).
+    """
+    hdmis_connected = check_hdmis_connected()
+    
+    # Detect USB conference mic (has both capture and playback)
+    usb_conference_mic = None
+    for card_num in range(card_count):
+        card_name = get_card_name(card_num)
+        if is_usb_device(card_name):
+            has_capture = os.path.exists(f"/dev/snd/pcmC{card_num}D0c")
+            has_playback = os.path.exists(f"/dev/snd/pcmC{card_num}D0p")
+            if has_capture and has_playback:
+                usb_conference_mic = card_num
+    
+    return hdmis_connected, usb_conference_mic
 
 
 def test_capture_device(hw: str, duration: int = 3) -> tuple[bool, float, str]:
@@ -161,7 +210,9 @@ def find_working_mic(card_count: int) -> dict | None:
     return None
 
 
-def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
+def find_working_speaker(mic_hw: str, card_count: int,
+                         hdmis_connected: dict,
+                         usb_conference_mic: int | None) -> dict | None:
     """Play tone through each device, record with mic, check detection.
 
     This is the simplest, most universal approach:
@@ -171,12 +222,24 @@ def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
     4. Pick the one with highest peak
     """
     print("\n=== Phase 2: Finding Speaker ===")
-    print("Playing tone through each device, recording with mic...\n")
+    print("Checking hardware connections and playing tone...")
+    if hdmis_connected:
+        print(f"HDMI monitors connected on cards: {list(hdmis_connected.keys())}")
+    else:
+        print("No HDMI monitors detected.")
+    print("Recording with mic to verify physical pair...\n")
 
     detected = []
 
     for card in range(card_count):
         card_name = get_card_name(card)
+        
+        # Skip disconnected HDMI outputs
+        if not hdmis_connected.get(card, False):
+            if is_hdm_device(card_name) or card in [0, 1, 4]:
+                print(f"  Skipping {card_name}: disconnected")
+                continue
+        
         for dev in range(MAX_DEVICES_PER_CARD):
             hw = f"hw:{card},{dev}"
 
@@ -214,11 +277,19 @@ def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
                     peak = float(np.max(np.abs(samples)))
 
                     if peak > 100:
-                        detected.append({
-                            "hw": hw, "name": card_name, "card": card,
-                            "peak": peak,
-                        })
-                        print(f"  + {hw} ({card_name}) heard (peak: {peak:.0f})")
+                        # Prefer USB conference mic playback
+                        if usb_conference_mic is not None and card == usb_conference_mic:
+                            print(f"  + {hw} ({card_name}) [USB HEADSET] heard (peak: {peak:.0f})")
+                            detected.insert(0, {  # Add to front
+                                "hw": hw, "name": card_name, "card": card,
+                                "peak": peak, "usb": True,
+                            })
+                        else:
+                            print(f"  + {hw} ({card_name}) heard (peak: {peak:.0f})")
+                            detected.append({
+                                "hw": hw, "name": card_name, "card": card,
+                                "peak": peak, "usb": False,
+                            })
                     else:
                         print(f"  - {hw} ({card_name}): too quiet (peak: {peak:.0f})")
                 else:
@@ -234,8 +305,10 @@ def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
 
     if detected:
         best = max(detected, key=lambda d: d["peak"])
-        print(f"\n  Selected speaker: {best['hw']} (peak: {best['peak']:.0f})")
-        if len(detected) > 1:
+        print(f"\n  Selected speaker: {best['hw']} ({best['name']})")
+        if best.get("usb"):
+            print("  -> USB conference mic with integrated speaker")
+        elif len(detected) > 1:
             others = [d['hw'] for d in detected if d['hw'] != best['hw']]
             print(f"  Also detected: {others}")
         return best
@@ -376,6 +449,12 @@ def main() -> None:
     card_count = get_card_count()
     print(f"\n=== GLaDOS Spoke Audio Setup ===")
     print(f"Detected {card_count} ALSA cards\n")
+    
+    # Get hardware info for smart speaker detection
+    hdmis_connected, usb_conference_mic = get_hardware_info(card_count)
+    if usb_conference_mic is not None:
+        usb_name = get_card_name(usb_conference_mic)
+        print(f"USB conference mic detected on card {usb_conference_mic} ({usb_name})")
 
     mic_info = find_working_mic(card_count)
     if not mic_info:
@@ -384,7 +463,7 @@ def main() -> None:
 
     mic_hw = mic_info["hw"]
 
-    spk_info = find_working_speaker(mic_hw, card_count)
+    spk_info = find_working_speaker(mic_hw, card_count, hdmis_connected, usb_conference_mic)
     if not spk_info:
         print("\nERROR: No speaker detected by the microphone.")
         print("Try: glados-spoke setup --manual")
