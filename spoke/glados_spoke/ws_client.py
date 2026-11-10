@@ -331,6 +331,27 @@ class SpeakerClient(ReconnectingWS):
         self._playback_lock = asyncio.Lock()
         self._stop_playback = False
 
+    def _get_supported_rates(self) -> list[int]:
+        """Return sample rates this speaker device supports, in preference order."""
+        try:
+            if self.spk_device is not None:
+                dev = sd.query_devices(device=self.spk_device)
+                native = int(round(dev.get("default_samplerate", 0)))
+            else:
+                dev = sd.query_devices(kind="output")
+                native = int(round(dev.get("default_samplerate", 22050)))
+            if native and native > 0:
+                return [native, 22050, 16000, 44100]
+        except Exception:
+            pass
+        return [22050, 16000, 44100]
+
+    async def on_open(self) -> None:
+        """Send our supported sample rates on connection."""
+        rates = self._get_supported_rates()
+        await self.send("capabilities:" + ",".join(str(r) for r in rates))
+        logger.info("Speaker: advertised supported rates {}", rates)
+
     async def _play(self, data: bytes, sample_rate: int) -> None:
         """Decode and play audio via sounddevice."""
         if not data:

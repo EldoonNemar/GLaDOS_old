@@ -80,6 +80,7 @@ class WebsocketAudioIO(AudioIO):
     """
 
     SAMPLE_RATE: int = 22050  # Sample rate for TTS output stream; mic is resampled to 16000 for ASR
+    SPEAKER_NATIVE_RATE: int = 16000  # Native sample rate spoken by speaker devices (XVF3800, etc.)
     VAD_SAMPLE_RATE: int = 16000  # Sample rate for VAD and ASR
     VAD_SIZE: int = 32  # Milliseconds of sample for Voice Activity Detection (VAD)
     VAD_THRESHOLD: float = 0.8  # Threshold for VAD detection
@@ -566,6 +567,8 @@ class WebsocketAudioIO(AudioIO):
         """
 
         room = self._default_room_tag
+        # Track per-connection negotiated sample rate
+        speaker_sample_rate: int | None = None
 
         async def handle_default_msg(ws_msg: str | bytes) -> bool:
             """Handle the default ws messages. Returns True if the message is not a default message"""
@@ -575,6 +578,21 @@ class WebsocketAudioIO(AudioIO):
             elif isinstance(ws_msg, str) and ws_msg.startswith("room:"):
                 nonlocal room
                 room = ws_msg.split(":", maxsplit=1)[1]
+                return False
+            elif isinstance(ws_msg, str) and ws_msg.startswith("capabilities:"):
+                nonlocal speaker_sample_rate
+                # Parse "capabilities:16000,22050,44100" — pick first rate hub also supports
+                rates_str = ws_msg.split(":", maxsplit=1)[1]
+                supported = [int(r.strip()) for r in rates_str.split(",") if r.strip().isdigit()]
+                # Hub supports: TTS rate (22050) and mic rate (16000)
+                hub_rates = {self.SAMPLE_RATE, self.VAD_SAMPLE_RATE}
+                for rate in supported:
+                    if rate in hub_rates:
+                        speaker_sample_rate = rate
+                        logger.info("Speaker {}: negotiated sample rate {}", websocket.remote_address, rate)
+                        break
+                else:
+                    logger.warning("Speaker {}: no compatible rate in {}", websocket.remote_address, supported)
                 return False
             return True
 
@@ -632,7 +650,8 @@ class WebsocketAudioIO(AudioIO):
                 if self._audio_data is None:
                     continue
                 play_time = self._audio_data.play_time
-                sample_rate = self._audio_data.sample_rate
+                # Use negotiated speaker rate, fall back to TTS rate
+                effective_sample_rate = speaker_sample_rate or self._audio_data.sample_rate or 22050
                 audio_format = self._audio_data.audio_format
                 if audio_format == "mp3" and self._audio_data.mp3_data:
                     audio_data_bytes = self._audio_data.mp3_data
@@ -650,10 +669,10 @@ class WebsocketAudioIO(AudioIO):
                 # Send format, timestamp, sample rate, then bytes
                 await websocket.send("format:" + audio_format)
                 await websocket.send("time:" + str(play_time))
-                await websocket.send("sampleRate:" + str(sample_rate or 22050))
+                await websocket.send("sampleRate:" + str(effective_sample_rate))
                 await websocket.send(audio_data_bytes)
 
-                logger.debug(f"Playing audio {audio_format} with sample rate: {sample_rate} Hz, size: {sample_count} bytes")
+                logger.debug(f"Playing audio {audio_format} with sample rate: {effective_sample_rate} Hz, size: {sample_count} bytes")
             except websockets.exceptions.ConnectionClosed:
                 set_flags_once(current_track_id, True)
                 return
