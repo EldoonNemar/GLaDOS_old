@@ -16,6 +16,13 @@ except ImportError:
     print("ERROR: numpy required")
     sys.exit(1)
 
+# For FFT-based tone detection
+try:
+    from scipy import fftpack
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
 CONFIG_FILE = "spoke_config.yaml"
 MAX_CARDS = 8
 MAX_DEVICES_PER_CARD = 4
@@ -119,6 +126,45 @@ def get_hardware_info(card_count: int) -> tuple[dict, int | None]:
                 usb_conference_mic = card_num
     
     return hdmis_connected, usb_conference_mic
+
+
+def detect_tone_frequency(wav_path: str, sample_rate: int, target_freq: float) -> float:
+    """Detect if a specific frequency is present in a WAV file using FFT.
+    
+    Returns the amplitude at the target frequency (0.0 if not present).
+    """
+    try:
+        with open(wav_path, "rb") as f:
+            f.read(44)
+            raw = f.read()
+        
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+        samples = samples - np.mean(samples)  # Remove DC offset
+        
+        n = len(samples)
+        if n < 256:
+            return 0.0
+        
+        # Compute FFT
+        spectrum = fftpack.rfft(samples)
+        freqs = fftpack.rfftfreq(n, d=1.0/sample_rate)
+        
+        # Find the bin closest to target frequency
+        idx = np.argmin(np.abs(freqs - target_freq))
+        
+        # Check if the peak at target frequency is significant
+        peak_amplitude = abs(spectrum[idx])
+        
+        # Compare to average spectrum level to ensure it's a real tone, not noise
+        avg_amplitude = np.mean(np.abs(spectrum))
+        signal_ratio = peak_amplitude / (avg_amplitude + 1e-10)
+        
+        if signal_ratio > 2.0:  # Must be at least 2x above average
+            return float(peak_amplitude)
+        
+        return 0.0
+    except Exception:
+        return 0.0
 
 
 def test_capture_device(hw: str, duration: int = 3) -> tuple[bool, float, str]:
@@ -270,28 +316,33 @@ def find_working_speaker(mic_hw: str, card_count: int,
                 kill_speaker_test(hw)
 
                 if os.path.exists(output) and os.path.getsize(output) > 200:
-                    with open(output, "rb") as f:
-                        f.read(44)
-                        raw = f.read()
-                    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-                    peak = float(np.max(np.abs(samples)))
-
-                    if peak > 100:
+                    # Use FFT to detect the exact 1kHz tone we played
+                    if HAS_SCIPY:
+                        tone_amp = detect_tone_frequency(output, sample_rate=16000, target_freq=1000.0)
+                    else:
+                        # Fallback to peak if scipy not available
+                        with open(output, "rb") as f:
+                            f.read(44)
+                            raw = f.read()
+                        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                        tone_amp = float(np.max(np.abs(samples)))
+                    
+                    if tone_amp > 100:
                         # Prefer USB conference mic playback
                         if usb_conference_mic is not None and card == usb_conference_mic:
-                            print(f"  + {hw} ({card_name}) [USB HEADSET] heard (peak: {peak:.0f})")
+                            print(f"  + {hw} ({card_name}) [USB HEADSET] tone detected (FFT: {tone_amp:.0f})")
                             detected.insert(0, {  # Add to front
                                 "hw": hw, "name": card_name, "card": card,
-                                "peak": peak, "usb": True,
+                                "peak": tone_amp, "usb": True,
                             })
                         else:
-                            print(f"  + {hw} ({card_name}) heard (peak: {peak:.0f})")
+                            print(f"  + {hw} ({card_name}) tone detected (FFT: {tone_amp:.0f})")
                             detected.append({
                                 "hw": hw, "name": card_name, "card": card,
-                                "peak": peak, "usb": False,
+                                "peak": tone_amp, "usb": False,
                             })
                     else:
-                        print(f"  - {hw} ({card_name}): too quiet (peak: {peak:.0f})")
+                        print(f"  - {hw} ({card_name}): tone not detected (FFT: {tone_amp:.0f})")
                 else:
                     print(f"  - {hw} ({card_name}): no recording")
 
