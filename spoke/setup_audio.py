@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Universal GLaDOS Spoke audio device auto-detection.
-
-Phase 1: Find the mic that picks up sound
-Phase 2: Play tone through each device, record with mic, check detection
-Phase 3: Verify the pair
-
-No playback pre-test. Just play and see what happens.
-"""
+"""Universal GLaDOS Spoke audio device auto-detection."""
 
 from __future__ import annotations
 
@@ -77,11 +70,6 @@ def is_usb_device(card_name: str) -> bool:
     return ("usb" in lower or "pdp" in lower or "jabra" in lower or
             "plantronics" in lower or "logitech" in lower or
             "blue" in lower or "steelseries" in lower)
-
-
-def is_input_only(card_name: str) -> bool:
-    lower = card_name.lower()
-    return "hdmiin" in lower or "capture" in lower
 
 
 def test_capture_device(hw: str, duration: int = 3) -> tuple[bool, float, str]:
@@ -176,22 +164,21 @@ def find_working_mic(card_count: int) -> dict | None:
 def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
     """Play tone through each device, record with mic, check detection.
 
-    No pre-test. Just play and see what happens.
+    This is the simplest, most universal approach:
+    1. Play 1kHz tone through device
+    2. Record with mic
+    3. If mic hears it, that device COULD be the speaker
+    4. Pick the one with highest peak
     """
     print("\n=== Phase 2: Finding Speaker ===")
-    print("Playing 1kHz tone through each device, recording with mic...\n")
+    print("Playing tone through each device, recording with mic...\n")
 
-    detected = []  # Devices the mic heard
+    detected = []
 
     for card in range(card_count):
         card_name = get_card_name(card)
         for dev in range(MAX_DEVICES_PER_CARD):
             hw = f"hw:{card},{dev}"
-
-            # Skip input-only devices (HDMI-IN, etc.)
-            if is_input_only(card_name):
-                print(f"  - {hw} ({card_name}): input-only, skipped")
-                continue
 
             output = f"/tmp/glados-spk-{hw.replace(',', '-')}.wav"
             try:
@@ -200,14 +187,12 @@ def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
                 except OSError:
                     pass
 
-                # Play tone
                 spk = subprocess.Popen(
                     ["speaker-test", "-t", "sine", "-f", "1000", "-l", "1",
                      "-c", "2", "-D", hw],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     start_new_session=True)
 
-                # Record with mic
                 rec = subprocess.Popen(
                     ["arecord", "-D", mic_hw, "-f", "S16_LE", "-r", "16000",
                      "-c", "1", "-d", "5", output],
