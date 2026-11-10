@@ -22,6 +22,27 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _alsa_hw_to_device(hw: str) -> int | None:
+    """Convert ALSA hw:X,Y string to sounddevice device index."""
+    try:
+        parts = hw.replace("hw:", "").split(",")
+        if len(parts) != 2:
+            return None
+        
+        card = int(parts[0])
+        device = int(parts[1])
+        
+        for i, dev in enumerate(sd.query_devices()):
+            name = dev.get("name", "")
+            if f"hw:{card},{device}" in name or f"[hw:{card},{device}]" in name:
+                logger.info("sounddevice device %d matches ALSA %s: %s", i, hw, name)
+                return i
+    except Exception as e:
+        logger.warning("Failed to convert ALSA %s to device index: %s", hw, e)
+    
+    return None
+
+
 class SpeexAEC:
     """Acoustic echo cancellation backed by libspeexdsp.
 
@@ -154,10 +175,33 @@ class SpokeAudio:
         self.mic_sample_rate = mic_sample_rate
         self.mic_channels = mic_channels
         self.mic_chunk_frames = mic_chunk_frames
-        self.mic_device = mic_device
+        
+        # Convert ALSA hw:X,Y to sounddevice index if needed
+        if isinstance(mic_device, str):
+            converted = _alsa_hw_to_device(mic_device)
+            if converted is not None:
+                self.mic_device = converted
+                logger.info("Converted ALSA mic %s to sounddevice index %d", mic_device, converted)
+            else:
+                logger.warning("Could not convert ALSA mic %s to index, using as-is", mic_device)
+                self.mic_device = mic_device
+        else:
+            self.mic_device = mic_device
+        
         self.mic_volume = mic_volume
         self.spk_sample_rate = spk_sample_rate
-        self.spk_device = spk_device
+        
+        # Convert ALSA hw:X,Y to sounddevice index if needed
+        if isinstance(spk_device, str):
+            converted = _alsa_hw_to_device(spk_device)
+            if converted is not None:
+                self.spk_device = converted
+                logger.info("Converted ALSA spk %s to sounddevice index %d", spk_device, converted)
+            else:
+                logger.warning("Could not convert ALSA spk %s to index, using as-is", spk_device)
+                self.spk_device = spk_device
+        else:
+            self.spk_device = spk_device
         self._aec: SpeexAEC | None = (
             SpeexAEC(sample_rate=self.MIC_SAMPLE_RATE, frame_size=mic_chunk_frames)
             if echo_aec_enabled and _HAS_SPEEX

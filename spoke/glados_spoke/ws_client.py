@@ -22,6 +22,32 @@ import websockets
 logger = logging.getLogger(__name__)
 
 
+def _alsa_hw_to_device(hw: str) -> int | None:
+    """Convert ALSA hw:X,Y string to sounddevice device index.
+    
+    Returns None if no matching device found.
+    """
+    try:
+        parts = hw.replace("hw:", "").split(",")
+        if len(parts) != 2:
+            return None
+        
+        card = int(parts[0])
+        device = int(parts[1])
+        
+        # Get all devices
+        for i, dev in enumerate(sd.query_devices()):
+            name = dev.get("name", "")
+            # Check if this device matches the ALSA hw address
+            if f"hw:{card},{device}" in name or f"[hw:{card},{device}]" in name:
+                logger.info("sounddevice device %d matches ALSA %s: %s", i, hw, name)
+                return i
+    except Exception as e:
+        logger.warning("Failed to convert ALSA %s to device index: %s", hw, e)
+    
+    return None
+
+
 def _build_url(host: str, port: int, path: str) -> str:
     return f"ws://{host}:{port}{path}"
 
@@ -287,7 +313,17 @@ class SpeakerClient(ReconnectingWS):
         **kwargs: Any,
     ) -> None:
         super().__init__(url, **kwargs)
-        self.spk_device = spk_device
+        # Convert ALSA hw:X,Y to sounddevice index if needed
+        if isinstance(spk_device, str):
+            converted = _alsa_hw_to_device(spk_device)
+            if converted is not None:
+                self.spk_device = converted
+                logger.info("Converted ALSA %s to sounddevice index %d", spk_device, converted)
+            else:
+                logger.warning("Could not convert ALSA %s to sounddevice index, using as-is", spk_device)
+                self.spk_device = spk_device
+        else:
+            self.spk_device = spk_device
         self._current_sample_rate: int = 22050
         self._current_play_time: float = 0.0
         self._current_id: str | None = None
