@@ -2,13 +2,10 @@
 """Universal GLaDOS Spoke audio device auto-detection.
 
 Phase 1: Find the mic that picks up sound
-Phase 2: Play through each device, record with mic, check detection
+Phase 2: Play tone through each device, record with mic, check detection
 Phase 3: Verify the pair
 
-Filters (physical reality, not assumptions):
-- Exclude HDMI-IN (input only, can't be speaker)
-- Exclude devices that fail playback test
-- Exclude devices where the mic doesn't hear the tone
+No playback pre-test. Just play and see what happens.
 """
 
 from __future__ import annotations
@@ -83,7 +80,6 @@ def is_usb_device(card_name: str) -> bool:
 
 
 def is_input_only(card_name: str) -> bool:
-    """Exclude HDMI-IN and other capture-only devices."""
     lower = card_name.lower()
     return "hdmiin" in lower or "capture" in lower
 
@@ -178,15 +174,12 @@ def find_working_mic(card_count: int) -> dict | None:
 
 
 def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
-    """Play through each device, record with mic, check detection.
+    """Play tone through each device, record with mic, check detection.
 
-    Filters:
-    - Exclude HDMI-IN (input-only, can't be speaker)
-    - Exclude devices that fail playback test
-    - Only report devices the mic actually heard
+    No pre-test. Just play and see what happens.
     """
     print("\n=== Phase 2: Finding Speaker ===")
-    print("Playing tone through each device, recording with mic...\n")
+    print("Playing 1kHz tone through each device, recording with mic...\n")
 
     detected = []  # Devices the mic heard
 
@@ -200,29 +193,6 @@ def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
                 print(f"  - {hw} ({card_name}): input-only, skipped")
                 continue
 
-            # Test playback capability
-            try:
-                spk = subprocess.Popen(
-                    ["speaker-test", "-t", "silence", "-l", "0",
-                     "-c", "2", "-D", hw],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    start_new_session=True)
-                stdout, stderr = spk.communicate(timeout=3)
-                if spk.returncode != 0:
-                    print(f"  - {hw} ({card_name}): playback failed")
-                    kill_speaker_test(hw)
-                    continue
-                spk.terminate()
-                try:
-                    spk.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    spk.kill()
-                kill_speaker_test(hw)
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                print(f"  - {hw} ({card_name}): playback failed")
-                continue
-
-            # Play tone and record with mic
             output = f"/tmp/glados-spk-{hw.replace(',', '-')}.wav"
             try:
                 try:
@@ -230,12 +200,14 @@ def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
                 except OSError:
                     pass
 
+                # Play tone
                 spk = subprocess.Popen(
                     ["speaker-test", "-t", "sine", "-f", "1000", "-l", "1",
                      "-c", "2", "-D", hw],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     start_new_session=True)
 
+                # Record with mic
                 rec = subprocess.Popen(
                     ["arecord", "-D", mic_hw, "-f", "S16_LE", "-r", "16000",
                      "-c", "1", "-d", "5", output],
