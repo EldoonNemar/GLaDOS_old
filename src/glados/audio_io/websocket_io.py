@@ -650,7 +650,7 @@ class WebsocketAudioIO(AudioIO):
                 # Send format, timestamp, sample rate, then bytes
                 await websocket.send("format:" + audio_format)
                 await websocket.send("time:" + str(play_time))
-                await websocket.send("sampleRate:" + str(sample_rate))
+                await websocket.send("sampleRate:" + str(sample_rate or 22050))
                 await websocket.send(audio_data_bytes)
 
                 logger.debug(f"Playing audio {audio_format} with sample rate: {sample_rate} Hz, size: {sample_count} bytes")
