@@ -2,10 +2,13 @@
 """Universal GLaDOS Spoke audio device auto-detection.
 
 Phase 1: Find the mic that picks up sound
-Phase 2: Play through EACH device, record with mic, check which one the mic hears
+Phase 2: Play through each device, record with mic, check detection
 Phase 3: Verify the pair
 
-No assumptions. Test every device.
+Filters (physical reality, not assumptions):
+- Exclude HDMI-IN (input only, can't be speaker)
+- Exclude devices that fail playback test
+- Exclude devices where the mic doesn't hear the tone
 """
 
 from __future__ import annotations
@@ -77,6 +80,12 @@ def is_usb_device(card_name: str) -> bool:
     return ("usb" in lower or "pdp" in lower or "jabra" in lower or
             "plantronics" in lower or "logitech" in lower or
             "blue" in lower or "steelseries" in lower)
+
+
+def is_input_only(card_name: str) -> bool:
+    """Exclude HDMI-IN and other capture-only devices."""
+    lower = card_name.lower()
+    return "hdmiin" in lower or "capture" in lower
 
 
 def test_capture_device(hw: str, duration: int = 3) -> tuple[bool, float, str]:
@@ -168,23 +177,30 @@ def find_working_mic(card_count: int) -> dict | None:
     return None
 
 
-def find_working_speaker(mic_hw: str, mic_card: int, card_count: int) -> dict | None:
-    """Test each device by playing a tone and recording with the mic.
+def find_working_speaker(mic_hw: str, card_count: int) -> dict | None:
+    """Play through each device, record with mic, check detection.
 
-    The device whose tone the mic hears is the correct speaker.
-    Tests ALL devices — no exclusions.
+    Filters:
+    - Exclude HDMI-IN (input-only, can't be speaker)
+    - Exclude devices that fail playback test
+    - Only report devices the mic actually heard
     """
     print("\n=== Phase 2: Finding Speaker ===")
     print("Playing tone through each device, recording with mic...\n")
 
-    detected = []  # All devices the mic heard
+    detected = []  # Devices the mic heard
 
     for card in range(card_count):
         card_name = get_card_name(card)
         for dev in range(MAX_DEVICES_PER_CARD):
             hw = f"hw:{card},{dev}"
 
-            # Test playback capability first
+            # Skip input-only devices (HDMI-IN, etc.)
+            if is_input_only(card_name):
+                print(f"  - {hw} ({card_name}): input-only, skipped")
+                continue
+
+            # Test playback capability
             try:
                 spk = subprocess.Popen(
                     ["speaker-test", "-t", "silence", "-l", "0",
@@ -206,7 +222,7 @@ def find_working_speaker(mic_hw: str, mic_card: int, card_count: int) -> dict | 
                 print(f"  - {hw} ({card_name}): playback failed")
                 continue
 
-            # Now test: play tone, record with mic
+            # Play tone and record with mic
             output = f"/tmp/glados-spk-{hw.replace(',', '-')}.wav"
             try:
                 try:
@@ -260,7 +276,6 @@ def find_working_speaker(mic_hw: str, mic_card: int, card_count: int) -> dict | 
                     pass
 
     if detected:
-        # Pick the one with highest peak
         best = max(detected, key=lambda d: d["peak"])
         print(f"\n  Selected speaker: {best['hw']} (peak: {best['peak']:.0f})")
         if len(detected) > 1:
@@ -273,7 +288,6 @@ def find_working_speaker(mic_hw: str, mic_card: int, card_count: int) -> dict | 
 
 
 def loopback_verify(speaker_hw: str, mic_hw: str) -> tuple[bool, float]:
-    """Verify with a tone."""
     output = "/tmp/glados-verify.wav"
     try:
         try:
@@ -412,9 +426,8 @@ def main() -> None:
         sys.exit(1)
 
     mic_hw = mic_info["hw"]
-    mic_card = mic_info["card"]
 
-    spk_info = find_working_speaker(mic_hw, mic_card, card_count)
+    spk_info = find_working_speaker(mic_hw, card_count)
     if not spk_info:
         print("\nERROR: No speaker detected by the microphone.")
         print("Try: glados-spoke setup --manual")
