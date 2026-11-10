@@ -246,7 +246,7 @@ class SpokeAudio:
         peak = np.max(np.abs(samples))
         if peak > 1.0:
             samples = samples / peak
-        elif peak < 0.01 and len(samples) > 0:  # Skip very quiet audio
+        elif peak < 0.0001 and len(samples) > 0:  # Skip truly silent audio
             return
 
         # --- Echo detection: compare mic audio with recent speaker output ---
