@@ -301,13 +301,13 @@ class WebsocketAudioIO(AudioIO):
             # allow for network jitter, time to websocket send, etc.
             sync_delay = self._speaker_sync_delay_ms / 1000
             self._audio_data = AudioData(
-                np.copy(audio_data),
-                mp3_data,
-                sample_rate,
-                time.time() + sync_delay,
-                time.monotonic() + sync_delay,
-                uuid.uuid4(),
-                audio_format,
+                data=np.copy(audio_data),
+                sample_rate=sample_rate,
+                play_time=time.time() + sync_delay,
+                play_time_monotonic=time.monotonic() + sync_delay,
+                mp3_data=mp3_data,
+                track_id=uuid.uuid4(),
+                audio_format=audio_format,
             )
             self._stop_playback = False
             self._playback_was_interrupted = False
