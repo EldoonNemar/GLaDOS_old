@@ -299,6 +299,28 @@ class MicClient(ReconnectingWS):
         await super().stop()
 
 
+def _resample_audio(samples: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
+    """Resample audio from one sample rate to another using scipy (or fallback)."""
+    try:
+        from scipy import signal as scipy_signal
+        if from_rate == to_rate:
+            return samples
+        num_samples = int(len(samples) * to_rate / from_rate)
+        if num_samples <= 0:
+            return samples
+        return scipy_signal.resample(samples, num_samples).astype(np.float32)
+    except Exception:
+        # Fallback: simple linear interpolation (no scipy)
+        if from_rate == to_rate or len(samples) == 0:
+            return samples
+        ratio = to_rate / from_rate
+        new_len = int(len(samples) * ratio)
+        if new_len <= 0:
+            return samples
+        indices = np.linspace(0, len(samples) - 1, new_len)
+        return np.interp(indices, np.arange(len(samples)), samples).astype(np.float32)
+
+
 class SpeakerClient(ReconnectingWS):
     """Speaker client: receives TTS audio from /speaker and plays it via sounddevice.
 
@@ -353,7 +375,7 @@ class SpeakerClient(ReconnectingWS):
         logger.info("Speaker: advertised supported rates {}", rates)
 
     async def _play(self, data: bytes, sample_rate: int) -> None:
-        """Decode and play audio via sounddevice."""
+        """Decode and play audio via sounddevice, with sample rate fallback."""
         if not data:
             return
 
@@ -375,26 +397,44 @@ class SpeakerClient(ReconnectingWS):
 
         # Cancel on interruption
         interrupted = False
+        played = False
 
-        try:
-            sd.play(samples, sample_rate, device=self.spk_device)
+        # Try playback at the negotiated rate first, then fall back to supported rates
+        rates_to_try = [sample_rate] + [r for r in self._get_supported_rates() if r != sample_rate]
 
-            # Wait for playback to finish or interruption
-            play_time_s = len(samples) / sample_rate
-            start = time.monotonic()
-            while not interrupted:
-                elapsed = time.monotonic() - start
-                if elapsed >= play_time_s:
-                    break
-                await asyncio.sleep(min(0.05, play_time_s - elapsed))
+        for try_rate in rates_to_try:
+            if try_rate != sample_rate:
+                logger.info("Speaker: resampling to %d Hz (fallback)", try_rate)
+                samples = _resample_audio(samples, sample_rate, try_rate)
 
-            sd.stop()
-        except Exception:
-            logger.exception("Speaker: playback error")
-        finally:
-            self._stop_playback = False
+            if self._stop_playback:
+                break
 
-        logger.info("Speaker: playback complete (%d samples)", len(samples))
+            try:
+                sd.play(samples, try_rate, device=self.spk_device)
+
+                # Wait for playback to finish or interruption
+                play_time_s = len(samples) / try_rate
+                start = time.monotonic()
+                while not interrupted:
+                    elapsed = time.monotonic() - start
+                    if elapsed >= play_time_s:
+                        break
+                    await asyncio.sleep(min(0.05, play_time_s - elapsed))
+
+                sd.stop()
+                played = True
+                logger.info("Speaker: playback complete at %d Hz (%d samples)", try_rate, len(samples))
+                break
+            except Exception:
+                logger.warning("Speaker: playback failed at %d Hz, trying next rate...", try_rate)
+                sd.stop()
+                continue
+
+        if not played:
+            logger.error("Speaker: all sample rate attempts failed")
+
+        self._stop_playback = False
 
     async def _handle_binary(self, data: bytes) -> None:
         if not data:
