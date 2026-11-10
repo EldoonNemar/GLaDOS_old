@@ -45,10 +45,10 @@ echo ""
 echo "=== Installation complete ==="
 echo "To use:"
 echo "  source $VENV_DIR/bin/activate"
-echo "  glados-spoke --hub <hub-ip> --port <port>"
+echo "  glados-spoke run --hub <hub-ip> --port <port>"
 echo ""
 echo "Or with config file:"
-echo "  glados-spoke --config spoke_config.yaml"
+echo "  glados-spoke run --config spoke_config.yaml"
 echo ""
 
 # Run audio device setup

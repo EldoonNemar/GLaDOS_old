@@ -541,7 +541,7 @@ def main() -> None:
     print(f"\nConfig written: {args.config}")
     print(f"  Speaker: {spk_hw}  ({spk_info['name']})")
     print(f"  Mic:     {mic_hw}  ({mic_info['name']})")
-    print(f"\nRun: glados-spoke --config {args.config}")
+    print(f"\nRun: glados-spoke run --config {args.config}")
 
 
 if __name__ == "__main__":
