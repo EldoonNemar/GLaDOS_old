@@ -354,16 +354,19 @@ class SpokeAudio:
             else:
                 _set_speaker_volume(hw_card=0)
             
+            # XVF3800 USB audio requires int16 format, 16000 Hz, blocksize=1024
             self._spk_stream = sd.OutputStream(
                 samplerate=self.spk_sample_rate,
                 channels=1,
                 device=self.spk_device,
+                blocksize=1024,
+                dtype=np.int16,  # XVF3800 requires S16_LE format
                 latency="low",
             )
             self._spk_stream.start()
-            logger.info("Speaker: %d Hz (volume: %d%%)", self.spk_sample_rate, volume_pct)
-        except Exception:
-            logger.warning("Speaker output unavailable (TTS will not play)")
+            logger.info("Speaker: %d Hz int16, volume: %d%%", self.spk_sample_rate, volume_pct)
+        except Exception as e:
+            logger.warning("Speaker output unavailable (TTS will not play): %s", e)
             self._spk_stream = None
 
     def stop_speaker(self) -> None:
@@ -385,7 +388,9 @@ class SpokeAudio:
         # the reference to the mic rate in the callback.
         self._playback_ref = samples.astype(np.float32)
         try:
-            sd.play(samples, self.spk_sample_rate, blocking=False)
+            # XVF3800 USB audio requires int16 format (S16_LE)
+            int16_samples = (samples * 32767.0).astype(np.int16)
+            sd.play(int16_samples, self.spk_sample_rate, blocking=False, dtype=np.int16)
         except Exception:
             logger.exception("Speaker playback error")
 

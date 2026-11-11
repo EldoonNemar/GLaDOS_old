@@ -376,26 +376,30 @@ class SpeakerClient(ReconnectingWS):
         Tests each candidate rate with a short silent burst. Returns
         the first rate that successfully opens the stream, or None.
         
-        Uses blocksize=1024 which is compatible with the XVF3800 hardware.
+        The XVF3800 USB audio device requires int16 format and specific
+        parameters. Uses blocksize=1024 for stability.
         """
         import numpy as np
         import sounddevice as sd  # noqa: F811
 
-        # Use a tiny silent buffer (0.05 s) for each probe
-        # blocksize=1024 is compatible with XVF3800 hardware
+        # The XVF3800 USB audio device is picky:
+        # - Requires int16 format (not float32)
+        # - Needs 16000 Hz (native rate)
+        # - blocksize=1024 for stability
         duration = 0.05
         for rate in self._get_supported_rates():
             try:
-                silent = np.zeros(int(rate * duration), dtype=np.float32)
+                silent = np.zeros(int(rate * duration), dtype=np.int16)
                 stream = sd.OutputStream(
                     samplerate=rate, channels=1, blocksize=1024,
                     device=self.spk_device, latency="low",
+                    dtype=np.int16,  # XVF3800 requires int16, not float32
                 )
                 stream.start()
                 stream.write(silent)
                 stream.stop()
                 stream.close()
-                logger.info("Speaker: probed working sample rate %d Hz", rate)
+                logger.info("Speaker: probed working sample rate %d Hz (int16)", rate)
                 return rate
             except Exception:
                 logger.debug("Speaker: probe failed at %d Hz", rate)
@@ -459,10 +463,13 @@ class SpeakerClient(ReconnectingWS):
                 break
 
             try:
-                sd.play(samples, try_rate, device=self.spk_device, blocking=False)
+                # Convert to int16 for XVF3800 USB audio device compatibility
+                # The XVF3800 requires S16_LE format (16-bit integer PCM)
+                int16_samples = (samples * 32767.0).astype(np.int16)
+                sd.play(int16_samples, try_rate, device=self.spk_device, blocking=False, dtype=np.int16)
 
                 # Wait for playback to finish or interruption
-                play_time_s = len(samples) / try_rate
+                play_time_s = len(int16_samples) / try_rate
                 start = time.monotonic()
                 while not interrupted:
                     elapsed = time.monotonic() - start
@@ -472,7 +479,7 @@ class SpeakerClient(ReconnectingWS):
 
                 sd.stop()
                 played = True
-                logger.info("Speaker: playback complete at %d Hz (%d samples)", try_rate, len(samples))
+                logger.info("Speaker: playback complete at %d Hz (%d samples)", try_rate, len(int16_samples))
                 break
             except Exception as e:
                 logger.warning("Speaker: playback failed at %d Hz: %s, trying next rate...", try_rate, e)
