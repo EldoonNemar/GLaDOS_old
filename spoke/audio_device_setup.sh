@@ -160,6 +160,7 @@ spoke:
   # --- Audio playback (hub to spoke) ---
   spk_sample_rate: 22050
   spk_device: $SPEAKER_CARD_NUM
+  spk_volume: 1.0
 
   # --- Echo detection ---
   echo_text_similarity_threshold: 0.7

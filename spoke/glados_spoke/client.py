@@ -59,6 +59,8 @@ class SpokeClient:
 
             spk_device=self.config.spk_device,
 
+            spk_volume=self.config.spk_volume,
+
             echo_aec_enabled=self.config.echo_aec_enabled,
 
             echo_aec_order=self.config.echo_aec_order,

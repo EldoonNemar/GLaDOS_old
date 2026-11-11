@@ -1,9 +1,16 @@
-"""Local audio capture and playback for the spoke."""
+"""Local audio capture and playback for the spoke.
+
+Hardcoded for the reSpeaker XVF3800:
+- Mic: sounddevice index 0 (ALSA hw:0,0)
+- Speaker: sounddevice index 0 (ALSA hw:0,0)
+- Volume: set to 100% at startup via ALSA amixer to override XVF3800's 50% default
+"""
 
 from __future__ import annotations
 
 import logging
 import math
+import subprocess
 import numpy as np
 from numpy.typing import NDArray
 
@@ -41,6 +48,53 @@ def _alsa_hw_to_device(hw: str) -> int | None:
         logger.warning("Failed to convert ALSA %s to device index: %s", hw, e)
     
     return None
+
+
+def _set_speaker_volume(hw_card: int = 0, volume_pct: int = 100) -> None:
+    """Set the ALSA speaker master volume for the XVF3800.
+
+    The reSpeaker XVF3800 defaults its DAC/amp to ~50% on first open.
+    This function explicitly sets PCM volume to 100% so GLaDOS is audible.
+
+    Args:
+        hw_card: ALSA card number (0 for XVF3800 on the RPi).
+        volume_pct: Volume percentage, 0-100 (default 100).
+    """
+    # Try multiple control names that the XVF3800 might expose
+    controls = [
+        f"PCM,{hw_card}",
+        f"PCM Card {hw_card}",
+        f"Playback Digital,{hw_card}",
+        f"Speaker,{hw_card}",
+        f"Speaker Digital,{hw_card}",
+        f"ADC,{hw_card}",
+    ]
+    for ctrl in controls:
+        try:
+            result = subprocess.run(
+                ["amixer", "-c", str(hw_card), "-D", "pwrseq", "set", ctrl, f"{volume_pct}%"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                logger.info("Set speaker volume %d%% via ALSA control '%s'", volume_pct, ctrl)
+                return
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+
+    # Fallback: try without pwrseq
+    for ctrl in controls:
+        try:
+            result = subprocess.run(
+                ["amixer", "-c", str(hw_card), "set", ctrl, f"{volume_pct}%"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                logger.info("Set speaker volume %d%% via ALSA control '%s' (no pwrseq)", volume_pct, ctrl)
+                return
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+
+    logger.warning("Could not set speaker volume — try manually: amixer -c %d set PCM %d%%", hw_card, volume_pct)
 
 
 class SpeexAEC:
@@ -163,10 +217,11 @@ class SpokeAudio:
         mic_sample_rate: int = 16000,
         mic_channels: int = 1,
         mic_chunk_frames: int = 512,
-        mic_device: int | str | None = None,
+        mic_device: int | str | None = 0,
         mic_volume: float = 1.0,
         spk_sample_rate: int = 22050,
-        spk_device: int | str | None = None,
+        spk_device: int | str | None = 0,
+        spk_volume: float = 1.0,
         echo_aec_enabled: bool = False,
         echo_aec_order: int = 256,  # noqa: ARG002 -- kept for config compat
     ) -> None:
@@ -202,6 +257,12 @@ class SpokeAudio:
                 self.spk_device = spk_device
         else:
             self.spk_device = spk_device
+
+        self.spk_volume = spk_volume
+
+        logger.info("Audio initialized for XVF3800: mic_device=%d, spk_device=%d, spk_volume=%.0f%%",
+                     self.mic_device, self.spk_device, self.spk_volume * 100)
+
         self._aec: SpeexAEC | None = (
             SpeexAEC(sample_rate=self.MIC_SAMPLE_RATE, frame_size=mic_chunk_frames)
             if echo_aec_enabled and _HAS_SPEEX
@@ -284,6 +345,14 @@ class SpokeAudio:
 
     def start_speaker(self) -> None:
         try:
+            # Set ALSA volume to 100% before opening the stream.
+            # The XVF3800 defaults its DAC/amp to ~50% on first open.
+            volume_pct = int(self.spk_volume * 100)
+            if volume_pct < 100:
+                _set_speaker_volume(hw_card=0, volume_pct=volume_pct)
+            else:
+                _set_speaker_volume(hw_card=0)
+            
             self._spk_stream = sd.OutputStream(
                 samplerate=self.spk_sample_rate,
                 channels=1,
@@ -291,7 +360,7 @@ class SpokeAudio:
                 latency="low",
             )
             self._spk_stream.start()
-            logger.info("Speaker: %d Hz", self.spk_sample_rate)
+            logger.info("Speaker: %d Hz (volume: %d%%)", self.spk_sample_rate, volume_pct)
         except Exception:
             logger.warning("Speaker output unavailable (TTS will not play)")
             self._spk_stream = None
