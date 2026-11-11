@@ -61,18 +61,19 @@ def _set_speaker_volume(hw_card: int = 0, volume_pct: int = 100) -> None:
         volume_pct: Volume percentage, 0-100 (default 100).
     """
     # Try multiple control names that the XVF3800 might expose
+    # The XVF3800 uses a Cirrus Logic CS35L41 amp and ICS-43434 mic
     controls = [
-        f"PCM,{hw_card}",
-        f"PCM Card {hw_card}",
-        f"Playback Digital,{hw_card}",
-        f"Speaker,{hw_card}",
-        f"Speaker Digital,{hw_card}",
-        f"ADC,{hw_card}",
+        "PCM",
+        "Master",
+        "Playback",
+        "Speaker",
+        "Digital",
+        "ADC",
     ]
     for ctrl in controls:
         try:
             result = subprocess.run(
-                ["amixer", "-c", str(hw_card), "-D", "pwrseq", "set", ctrl, f"{volume_pct}%"],
+                ["amixer", "-c", str(hw_card), "set", ctrl, f"{volume_pct}%", "-q"],
                 capture_output=True, text=True, timeout=3,
             )
             if result.returncode == 0:
@@ -81,15 +82,15 @@ def _set_speaker_volume(hw_card: int = 0, volume_pct: int = 100) -> None:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             continue
 
-    # Fallback: try without pwrseq
+    # Try with explicit device specification as fallback
     for ctrl in controls:
         try:
             result = subprocess.run(
-                ["amixer", "-c", str(hw_card), "set", ctrl, f"{volume_pct}%"],
+                ["amixer", "-c", str(hw_card), "-D", "default", "set", ctrl, f"{volume_pct}%", "-q"],
                 capture_output=True, text=True, timeout=3,
             )
             if result.returncode == 0:
-                logger.info("Set speaker volume %d%% via ALSA control '%s' (no pwrseq)", volume_pct, ctrl)
+                logger.info("Set speaker volume %d%% via ALSA control '%s' (default device)", volume_pct, ctrl)
                 return
         except (subprocess.TimeoutExpired, FileNotFoundError):
             continue

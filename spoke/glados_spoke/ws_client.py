@@ -375,16 +375,22 @@ class SpeakerClient(ReconnectingWS):
 
         Tests each candidate rate with a short silent burst. Returns
         the first rate that successfully opens the stream, or None.
+        
+        Uses blocksize=1024 which is compatible with the XVF3800 hardware.
         """
         import numpy as np
         import sounddevice as sd  # noqa: F811
 
         # Use a tiny silent buffer (0.05 s) for each probe
+        # blocksize=1024 is compatible with XVF3800 hardware
         duration = 0.05
         for rate in self._get_supported_rates():
             try:
                 silent = np.zeros(int(rate * duration), dtype=np.float32)
-                stream = sd.OutputStream(samplerate=rate, channels=1, blocksize=256)
+                stream = sd.OutputStream(
+                    samplerate=rate, channels=1, blocksize=1024,
+                    device=self.spk_device, latency="low",
+                )
                 stream.start()
                 stream.write(silent)
                 stream.stop()
@@ -453,7 +459,7 @@ class SpeakerClient(ReconnectingWS):
                 break
 
             try:
-                sd.play(samples, try_rate, device=self.spk_device)
+                sd.play(samples, try_rate, device=self.spk_device, blocking=False)
 
                 # Wait for playback to finish or interruption
                 play_time_s = len(samples) / try_rate
@@ -468,9 +474,12 @@ class SpeakerClient(ReconnectingWS):
                 played = True
                 logger.info("Speaker: playback complete at %d Hz (%d samples)", try_rate, len(samples))
                 break
-            except Exception:
-                logger.warning("Speaker: playback failed at %d Hz, trying next rate...", try_rate)
-                sd.stop()
+            except Exception as e:
+                logger.warning("Speaker: playback failed at %d Hz: %s, trying next rate...", try_rate, e)
+                try:
+                    sd.stop()
+                except Exception:
+                    pass
                 continue
 
         if not played:

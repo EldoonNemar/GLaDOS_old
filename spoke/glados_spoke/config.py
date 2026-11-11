@@ -31,7 +31,7 @@ class SpokeConfig(BaseModel):
     mic_volume: float = Field(default=1.0, ge=0.0, le=5.0)
 
     # --- Audio playback (hub to spoke) ---
-    spk_sample_rate: int = Field(default=22050, ge=8000, le=48000)
+    spk_sample_rate: int = Field(default=16000, ge=8000, le=48000)
     spk_device: int | str | None = Field(default=0, description="XVF3800 speaker sounddevice index (always 0)")
     spk_volume: float = Field(default=1.0, ge=0.0, le=1.0, description="Speaker master volume, 0.0-1.0 (1.0 = 100%)")
 

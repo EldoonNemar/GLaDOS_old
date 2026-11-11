@@ -455,7 +455,7 @@ def test_rates(hw: str, is_capture: bool) -> list[int]:
 
 def write_config(spk_hw: str, mic_hw: str, spk_rates: list[int],
                  mic_rates: list[int], path: str) -> None:
-    spk_rate = 22050 if 22050 in spk_rates else (44100 if 44100 in spk_rates else 48000)
+    spk_rate = 16000 if 16000 in spk_rates else (22050 if 22050 in spk_rates else 48000)
     mic_rate = 16000 if 16000 in mic_rates else 48000
 
     config = {
